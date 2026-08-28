@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CrossPoint Reader — Web Demo</title>
+<script>
+  // Enable cross-origin isolation (SharedArrayBuffer / pthreads) on static hosts
+  // that can't set COOP/COEP headers. No-op when the server already isolates us.
+  (function () {
+    if (window.crossOriginIsolated) return;
+    if (!window.isSecureContext || !('serviceWorker' in navigator)) return;
+    navigator.serviceWorker.register('coi-serviceworker.js').then(function (reg) {
+      if (reg.active && !navigator.serviceWorker.controller) window.location.reload();
+    }).catch(function () {});
+  })();
+</script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: safe center; gap: 10px; padding: 8px;
+    background: radial-gradient(1200px 700px at 50% -10%, #1c2027, #101216 60%);
+    color: #d7dbe0; font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+    overflow: auto;
+  }
+  #title { text-align: center; line-height: 1.25; }
+  #title b { font-size: 14px; font-weight: 600; color: #e7ebf0; letter-spacing: .2px; }
+  #title span { font-size: 11px; color: #8b929c; }
+  .device {
+    position: relative; width: fit-content; padding: 8px; border-radius: 16px;
+    background: #23272e; box-shadow: 0 10px 40px rgba(0,0,0,.5), inset 0 0 0 1px #30353d;
+  }
+  /* The panel is a portrait e-ink frame. It is integer-scaled by JS (fitPanel)
+     to the largest whole multiple of its native size that fits the window, and
+     drawn with nearest-neighbour so dithered grays stay crisp. */
+  canvas {
+    display: block; background: #fff; border-radius: 4px;
+    image-rendering: pixelated;
+    box-shadow: 0 0 0 1px #000, 0 6px 20px rgba(0,0,0,.45); outline: none;
+  }
+  .legend {
+    font-size: 12px; color: #aab0b9; display: flex; gap: 6px 16px;
+    flex-wrap: wrap; justify-content: center; max-width: 96vw;
+  }
+  .legend b { color: #e7ebf0; font-weight: 600; }
+  kbd {
+    background: #2c313a; border: 1px solid #3a414b; border-radius: 4px;
+    padding: 1px 6px; font-family: ui-monospace, monospace; font-size: 11px;
+    color: #e7ebf0;
+  }
+  /* Out-of-flow so it never steals vertical space from the panel. */
+  #status {
+    position: fixed; left: 0; right: 0; bottom: 6px; text-align: center;
+    font-size: 11px; color: #7f8792; pointer-events: none;
+  }
+  .spinner {
+    position: absolute; top: 50%; left: 50%; margin: -16px 0 0 -16px;
+    width: 32px; height: 32px; border: 3px solid #333a44; border-top-color: #7aa2f7;
+    border-radius: 50%; animation: spin 1s linear infinite; display: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div id="title">
+    <b>CrossPoint Reader — running in your browser</b><br />
+    <span>The actual e-reader firmware, compiled to WebAssembly &middot; portrait 480&times;800 &middot; read-only library &middot; networking off</span>
+  </div>
+  <div class="device" id="device">
+    <canvas id="canvas" width="480" height="800" tabindex="0"
+            oncontextmenu="event.preventDefault()"></canvas>
+    <div id="spinner" class="spinner"></div>
+  </div>
+  <div class="legend" id="legend">
+    <span><kbd>&larr;</kbd> <kbd>&rarr;</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <b>navigate / turn pages</b></span>
+    <span><kbd>Enter</kbd> <b>select / open</b></span>
+    <span><kbd>Esc</kbd> <b>back</b></span>
+    <span><kbd>H</kbd> <b>home</b></span>
+    <span><kbd>P</kbd> <b>power</b></span>
+    <span><kbd>S</kbd> <b>sleep</b></span>
+  </div>
+  <div id="status">preparing WebAssembly&hellip;</div>
+  <script>
+    var statusEl = document.getElementById('status');
+    var spinnerEl = document.getElementById('spinner');
+    var canvasEl = document.getElementById('canvas');
+
+    // Integer-scale the portrait panel to the largest whole multiple that fits
+    // the current window. Uses the SDL backing-store size (canvas.width/height,
+    // set by the firmware's window) so it also follows runtime orientation flips.
+    function fitPanel() {
+      var dpr = window.devicePixelRatio || 1;
+      var nativeW = Math.max(1, Math.round((canvasEl.width || 480) / dpr));
+      var nativeH = Math.max(1, Math.round((canvasEl.height || 800) / dpr));
+      var title = document.getElementById('title');
+      var legend = document.getElementById('legend');
+      // Vertical/horizontal chrome around the panel (title + legend + paddings).
+      var chromeH = (title ? title.offsetHeight : 0) + (legend ? legend.offsetHeight : 0) + 56;
+      var availW = window.innerWidth - 20;
+      var availH = window.innerHeight - chromeH;
+      var scale = Math.min(availW / nativeW, availH / nativeH);
+      scale = Math.max(1, Math.floor(scale)); // integer increments, min 1x
+      canvasEl.style.width = (nativeW * scale) + 'px';
+      canvasEl.style.height = (nativeH * scale) + 'px';
+    }
+    // Recompute whenever the backing store or the window size changes.
+    var lastKey = '';
+    function watch() {
+      var key = canvasEl.width + 'x' + canvasEl.height + '@' +
+                window.innerWidth + 'x' + window.innerHeight + '@' +
+                (window.devicePixelRatio || 1);
+      if (key !== lastKey) { lastKey = key; fitPanel(); }
+      requestAnimationFrame(watch);
+    }
+    window.addEventListener('resize', fitPanel);
+    fitPanel();
+    requestAnimationFrame(watch);
+
+    var Module = {
+      canvas: (function () {
+        canvasEl.addEventListener('webglcontextlost', function (e) {
+          statusEl.textContent = 'Graphics context lost — reload the page.';
+          e.preventDefault();
+        }, false);
+        return canvasEl;
+      })(),
+      print: function (t) { console.log(t); },
+      printErr: function (t) { console.error(t); },
+      setStatus: function (t) {
+        if (!statusEl) return;
+        if (t) {
+          statusEl.textContent = t;
+          spinnerEl.style.display = 'block';
+        } else {
+          statusEl.textContent = '';
+          spinnerEl.style.display = 'none';
+        }
+      },
+      onRuntimeInitialized: function () { canvasEl.focus(); fitPanel(); }
+    };
+    // Keep keyboard focus on the panel; stop arrows/space from scrolling the page.
+    window.addEventListener('click', function () { canvasEl.focus(); });
+    window.addEventListener('keydown', function (e) {
+      if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].indexOf(e.key) !== -1) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

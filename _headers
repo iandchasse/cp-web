@@ -1,0 +1,34 @@
+# Cloudflare Pages headers for the CrossPoint web reader.
+#
+# Cross-origin isolation is required for SharedArrayBuffer / pthreads (the
+# firmware's threaded render model). Cloudflare Pages lets you set these
+# directly, so no coi-serviceworker fallback is needed here.
+#
+# This file assumes the reader is deployed as its own Pages project (or at the
+# site root), so the rules target "/*". If instead you nest this bundle under an
+# existing site at /reader/, change every "/*" below to "/reader/*" so the
+# isolation stays scoped to the reader and does not affect the rest of the site
+# (e.g. third-party embeds elsewhere on de-link.me).
+#
+# IMPORTANT (Cloudflare Pages): only ONE _headers file is read, and it must live
+# at the deployed *site root*. A _headers inside a subfolder (e.g. /reader/_headers)
+# is IGNORED. So for a subpath deploy you must merge the rescoped rules below into
+# the site's root _headers, not leave this file in the subfolder. If you skip the
+# root _headers entirely, the bundled coi-serviceworker.js fallback still supplies
+# the isolation headers client-side (one extra reload on the very first visit).
+#
+# The SD filesystem (fonts/books/dictionaries under /fs/) is served same-origin,
+# so it needs no Cross-Origin-Resource-Policy header. If you later move large
+# blobs to R2 on a different origin, give those responses
+# `Cross-Origin-Resource-Policy: cross-origin` plus CORS so they load under COEP.
+
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+# Long-cache the immutable filesystem assets (content-addressed by path). Bump
+# the path or filename to bust the cache when you change a file.
+/fs/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Cache-Control: public, max-age=31536000, immutable

@@ -1,0 +1,240 @@
+diff --git a/src/HalDisplay.cpp b/src/HalDisplay.cpp
+index e3c5caa..d6f2877 100644
+--- a/src/HalDisplay.cpp
++++ b/src/HalDisplay.cpp
+@@ -28,6 +28,12 @@ static uint32_t
+     pixelBuf[HalDisplay::DISPLAY_WIDTH * HalDisplay::DISPLAY_HEIGHT];
+ static std::mutex pixelBufMutex;
+ static std::atomic<bool> pendingPresent{false};
++// Monotonic count of completed pixelBuf writes. pendingPresent is consumed
++// (exchange'd to false) by presentIfNeeded, so a second consumer -- the web
++// build's 3D view, which mirrors the panel into a WebGL texture -- cannot use
++// it. This counter is never consumed, so any number of readers can each track
++// "have I seen this frame?" independently of the SDL present path.
++static std::atomic<uint32_t> pixelBufFrame{0};
+ // Written by HalGPIO::update() (which owns SDL event polling); read by
+ // shouldQuit().
+ std::atomic<bool> quitRequested{false};
+@@ -171,6 +177,7 @@ void renderBwPixels(const uint8_t *fb) {
+           (white != invert) ? 0xFFFFFFFFu : 0xFF000000u;
+     }
+   }
++  pixelBufFrame.fetch_add(1);
+   pendingPresent.store(true);
+ }
+ 
+@@ -229,6 +236,7 @@ void composeGrayscalePreview() {
+       pixelBuf[y * HalDisplay::DISPLAY_WIDTH + x] = argbGray(level);
+     }
+   }
++  pixelBufFrame.fetch_add(1);
+   pendingPresent.store(true);
+ }
+ 
+@@ -414,13 +422,13 @@ void HalDisplay::refreshDisplay(RefreshMode /*mode*/, bool /*turnOffScreen*/) {
+ }
+ 
+ // Called from the main thread (simulator_main.cpp) to push pixels to SDL.
+-void HalDisplay::presentIfNeeded() {
++bool HalDisplay::presentIfNeeded() {
+   const bool screenshotDue = hasDueScreenshot();
+   if (!pendingPresent.exchange(false) && !screenshotDue)
+-    return;
++    return false;
+ 
+   if (!texture || !sdl_renderer)
+-    return;
++    return false;
+ 
+   extern GfxRenderer renderer;
+   const GfxRenderer::Orientation orientation = renderer.getOrientation();
+@@ -476,6 +484,7 @@ void HalDisplay::presentIfNeeded() {
+     captureDueScreenshots();
+   }
+   SDL_RenderPresent(sdl_renderer);
++  return true;
+ }
+ 
+ bool HalDisplay::shouldQuit() const { return quitRequested.load(); }
+@@ -578,3 +587,66 @@ uint16_t HalDisplay::getDisplayWidthBytes() const {
+ uint32_t HalDisplay::getBufferSize() const { return BUFFER_SIZE; }
+ 
+ HalDisplay display;
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++
++// ---------------------------------------------------------------------------
++// Live panel tap for the web build's 3D device view.
++//
++// The 3D view needs the panel as a WebGL texture. Reading it back off the SDL
++// canvas would mean preserveDrawingBuffer + a GPU->CPU->GPU round trip, which
++// is both slow and timing-fragile. Instead we expose the ARGB buffer the
++// renderer already maintains for SDL_UpdateTexture, and let JS upload it
++// directly as a DataTexture.
++//
++// cp_fb_sync() copies pixelBuf into a snapshot under pixelBufMutex and returns
++// the frame counter. JS compares that against the last value it uploaded and
++// skips the texture upload when nothing changed -- e-ink refreshes a few times
++// a second, not 60, so the steady-state cost here is nil.
++//
++// The snapshot copy is required, not defensive: JS must not hold a view into
++// pixelBuf while the render worker is writing it, and in a pthreads build
++// HEAPU8.buffer is a SharedArrayBuffer, which some browsers reject as a
++// texImage2D source. Copying once here solves both.
++//
++// ORIENTATION: pixelBuf is always the *physical* landscape panel. The firmware
++// rotates content into it, and presentIfNeeded() undoes that rotation so the
++// SDL window is upright -- correct for a monitor you cannot tilt. A 3D view
++// showing the real device must NOT undo it that way: there the panel sits
++// behind portrait glass, so buffer -> glass is a fixed transform and landscape
++// content is meant to look sideways. cp_fb_orientation() is exported for
++// callers that want the setting (HUDs, debug), not as a rotation to apply.
++// ---------------------------------------------------------------------------
++static uint32_t
++    fbSnapshot[HalDisplay::DISPLAY_WIDTH * HalDisplay::DISPLAY_HEIGHT];
++
++// Declared outside the extern "C" block below: inside it this would pick up C
++// linkage and clash with the C++ definition in the firmware's main.cpp.
++extern GfxRenderer renderer;
++
++extern "C" {
++
++EMSCRIPTEN_KEEPALIVE int cp_fb_width() { return HalDisplay::DISPLAY_WIDTH; }
++EMSCRIPTEN_KEEPALIVE int cp_fb_height() { return HalDisplay::DISPLAY_HEIGHT; }
++
++EMSCRIPTEN_KEEPALIVE uintptr_t cp_fb_ptr() {
++  return reinterpret_cast<uintptr_t>(fbSnapshot);
++}
++
++// Copy the current panel into the snapshot buffer; returns the frame counter.
++EMSCRIPTEN_KEEPALIVE uint32_t cp_fb_sync() {
++  const std::lock_guard<std::mutex> lock(pixelBufMutex);
++  memcpy(fbSnapshot, pixelBuf, sizeof(fbSnapshot));
++  return pixelBufFrame.load();
++}
++
++// Cheap poll so JS can skip the copy entirely when the panel is unchanged.
++EMSCRIPTEN_KEEPALIVE uint32_t cp_fb_counter() { return pixelBufFrame.load(); }
++
++// 0=Portrait 1=LandscapeClockwise 2=PortraitInverted 3=LandscapeCCW
++EMSCRIPTEN_KEEPALIVE int cp_fb_orientation() {
++  return static_cast<int>(renderer.getOrientation());
++}
++}
++#endif // __EMSCRIPTEN__
+diff --git a/src/HalDisplay.h b/src/HalDisplay.h
+index 0e41f0f..8c25fa6 100644
+--- a/src/HalDisplay.h
++++ b/src/HalDisplay.h
+@@ -88,7 +88,9 @@ public:
+   bool combinesGrayscaleBase() const;
+ 
+   // Simulator only: call from main thread to push rendered pixels to SDL.
+-  void presentIfNeeded();
++  // Returns true if a frame was actually flushed to the renderer this call
++  // (used by the web build to drop its "waking" splash on the first real frame).
++  bool presentIfNeeded();
+   // Simulator only: returns true once a hard shutdown has been requested.
+   bool shouldQuit() const;
+ 
+diff --git a/src/HalGPIO.cpp b/src/HalGPIO.cpp
+index 2c16cb2..b47651c 100644
+--- a/src/HalGPIO.cpp
++++ b/src/HalGPIO.cpp
+@@ -55,6 +55,11 @@ static bool releasedThisFrame[NUM_BUTTONS] = {};
+ static unsigned long buttonPressTime[NUM_BUTTONS] = {};
+ static bool syntheticButtonDown[NUM_BUTTONS] = {};
+ static bool simulatorSleepRequested = false;
++#ifdef __EMSCRIPTEN__
++// Set by startDeepSleep() in the browser build; while true web_main parks the
++// firmware loop() and only the power button wakes. See HalGPIO.h.
++static bool webSleepActive = false;
++#endif
+ 
+ namespace {
+ 
+@@ -743,6 +748,17 @@ bool HalGPIO::wasUsbStateChanged() const { return false; }
+ void HalGPIO::startDeepSleep() {
+   clearButtonState();
+ 
++#ifdef __EMSCRIPTEN__
++  // Browser: the main thread must return to the event loop each frame and there
++  // is no process to relaunch (no execvp). Park in a cooperative asleep state.
++  // The sleep screen goToSleep() already rendered stays on the canvas, web_main
++  // stops pumping the firmware loop(), and pollWebSleepWake() waits for the
++  // power button. Wake is a page reload (= chip reset), so state is restored
++  // from the IDBFS-backed /.crosspoint tree exactly as the device restores from
++  // SD after a power-wake.
++  webSleepActive = true;
++  return;
++#else
+   while (true) {
+     processSyntheticEvents();
+     if (quitRequested.load())
+@@ -770,9 +786,33 @@ void HalGPIO::startDeepSleep() {
+ 
+     SDL_Delay(10);
+   }
++#endif
+ }
+-bool HalGPIO::verifyPowerButtonWakeup(uint16_t /*requiredDurationMs*/,
+-                                      bool /*shortPressAllowed*/) {
++
++#ifdef __EMSCRIPTEN__
++bool HalGPIO::isWebSleepActive() const { return webSleepActive; }
++
++bool HalGPIO::pollWebSleepWake() {
++  SDL_Event e;
++  while (SDL_PollEvent(&e) != 0) {
++    if (e.type == SDL_QUIT) {
++      quitRequested.store(true);
++      return false;
++    }
++    // Only the power button wakes; every other key/touch is ignored so sleep is
++    // unresponsive like the hardware. Ignore auto-repeat so the same hold that
++    // triggered sleep can't immediately re-wake.
++    if (e.type == SDL_KEYDOWN && !e.key.repeat &&
++        e.key.keysym.scancode == buttonScancode[BTN_POWER]) {
++      clearButtonState();
++      webSleepActive = false;
++      return true;
++    }
++  }
++  return false;
++}
++#endif
++bool HalGPIO::verifyPowerButtonWakeup() {
+   return true;
+ }
+ 
+diff --git a/src/HalGPIO.h b/src/HalGPIO.h
+index 22b36bf..f7ee572 100644
+--- a/src/HalGPIO.h
++++ b/src/HalGPIO.h
+@@ -91,10 +91,23 @@ public:
+   // Setup wake up GPIO and enter deep sleep
+   void startDeepSleep();
+ 
++#ifdef __EMSCRIPTEN__
++  // Web shim only. In the browser the main thread must return to the event loop
++  // every frame and there is no process to relaunch on wake, so startDeepSleep()
++  // parks the simulator in a cooperative "asleep" state instead of blocking.
++  // web_main polls these each frame: while asleep it stops driving the firmware
++  // loop() and only a power-button press wakes (via a page reload = chip reset),
++  // matching hardware deep-sleep/wake semantics.
++  bool isWebSleepActive() const;
++  // Returns true once when the power button is pressed while asleep; the caller
++  // then persists state and reloads. Every other input is ignored, so sleep is
++  // unresponsive to anything but power, like the device.
++  bool pollWebSleepWake();
++#endif
++
+   // Verify power button was held long enough after wakeup.
+   // The host wake path is synthetic, so verification always succeeds.
+-  bool verifyPowerButtonWakeup(uint16_t requiredDurationMs,
+-                               bool shortPressAllowed);
++  bool verifyPowerButtonWakeup();
+ 
+   // Check if USB is connected
+   bool isUsbConnected() const;

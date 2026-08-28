@@ -1,0 +1,25 @@
+# Build outputs
+dist/
+obj/
+*.o
+*.d
+*.cmd
+
+# The SD card tree (~134 MB: books, fonts, dictionaries). Published as a
+# release asset instead -- see pins.env FS_CONTENT_TAG and scripts/pack-fs.ps1.
+fs_/
+
+# Upstream clones, pinned in pins.env and fetched by scripts/bootstrap.ps1
+firmware/
+simulator/
+emsdk/
+
+# Local QA scratch
+shots/
+node_modules/
+*.zip
+*.part-*
+
+# One-off CDP debugging scripts from past investigations. Kept on disk, not
+# shipped -- the maintained harness is qa/cdp_3d_input.mjs.
+/*.mjs

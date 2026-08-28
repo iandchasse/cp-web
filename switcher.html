@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CrossPoint Reader — Web Demo</title>
+<script>
+  // Enable cross-origin isolation (SharedArrayBuffer / pthreads) on static hosts
+  // that can't set COOP/COEP headers. No-op when the server already isolates us
+  // (e.g. Cloudflare Pages _headers), in which case crossOriginIsolated is already
+  // true and no worker is registered.
+  //
+  // First-visit handshake: the freshly-installed worker only starts injecting the
+  // isolation headers once it *controls* this document. clients.claim() in the
+  // worker's activate handler grabs control of this already-open page, which fires
+  // 'controllerchange' -> we reload once so the reloaded document boots isolated.
+  // A guard flag makes the reload fire at most once (no reload loop).
+  (function () {
+    if (window.crossOriginIsolated) return;
+    if (!window.isSecureContext || !('serviceWorker' in navigator)) return;
+    var reloaded = false;
+    function reloadOnce() { if (!reloaded) { reloaded = true; window.location.reload(); } }
+    navigator.serviceWorker.addEventListener('controllerchange', reloadOnce);
+    navigator.serviceWorker.register('coi-serviceworker.js').then(function (reg) {
+      // Worker already active from a previous visit but this tab isn't controlled
+      // (e.g. a hard navigation straight into scope): reload to pick it up.
+      if (reg.active && !navigator.serviceWorker.controller) reloadOnce();
+    }).catch(function () {});
+  })();
+</script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: safe center; gap: 10px; padding: 8px;
+    background: radial-gradient(1200px 700px at 50% -10%, #1c2027, #101216 60%);
+    color: #d7dbe0; font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+    overflow: auto;
+  }
+  #title { text-align: center; line-height: 1.3; }
+  #title b { font-size: 14px; font-weight: 600; color: #e7ebf0; letter-spacing: .2px; }
+  #title span { font-size: 11px; color: #8b929c; }
+  .controls {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    margin-top: 6px; flex-wrap: wrap;
+  }
+  .controls label { font-size: 11px; color: #8b929c; }
+  select {
+    background: #2c313a; color: #e7ebf0; border: 1px solid #3a414b;
+    border-radius: 6px; padding: 4px 8px; font-size: 12px; font-family: inherit;
+    cursor: pointer;
+  }
+  #note { font-size: 11px; color: #7aa2f7; }
+  .device {
+    position: relative; width: fit-content; padding: 8px; border-radius: 16px;
+    background: #23272e; box-shadow: 0 10px 40px rgba(0,0,0,.5), inset 0 0 0 1px #30353d;
+  }
+  /* The panel is a portrait e-ink frame. It is integer-scaled by JS (fitPanel)
+     to the largest whole multiple of its native size that fits the window, and
+     drawn with nearest-neighbour so dithered grays stay crisp.
+     Scoped by id, not element: a bare `canvas` selector also catches the
+     three.js canvas in 3D mode and paints an opaque white sheet over the
+     scene's transparent background. */
+  #canvas {
+    display: block; background: #fff; border-radius: 4px;
+    image-rendering: pixelated;
+    box-shadow: 0 0 0 1px #000, 0 6px 20px rgba(0,0,0,.45); outline: none;
+  }
+  .legend {
+    font-size: 12px; color: #aab0b9; display: flex; gap: 6px 16px;
+    flex-wrap: wrap; justify-content: center; max-width: 96vw;
+  }
+  .legend b { color: #e7ebf0; font-weight: 600; }
+  kbd {
+    background: #2c313a; border: 1px solid #3a414b; border-radius: 4px;
+    padding: 1px 6px; font-family: ui-monospace, monospace; font-size: 11px;
+    color: #e7ebf0;
+  }
+  /* Out-of-flow so it never steals vertical space from the panel. */
+  #status {
+    position: fixed; left: 0; right: 0; bottom: 6px; text-align: center;
+    font-size: 11px; color: #7f8792; pointer-events: none;
+  }
+  .spinner {
+    position: absolute; top: 50%; left: 50%; margin: -16px 0 0 -16px;
+    width: 32px; height: 32px; border: 3px solid #333a44; border-top-color: #7aa2f7;
+    border-radius: 50%; animation: spin 1s linear infinite; display: none;
+  }
+  /* "Waking…" splash held over the panel across a sleep/wake page reload so the
+     reader never appears to vanish while the runtime + in-memory FS re-init.
+     Paper-white to match the e-ink panel (and the boot splash it reveals). */
+  #wakeOverlay {
+    position: absolute; inset: 8px; border-radius: 4px; z-index: 5;
+    background: #f5f4ef; color: #2a2d33;
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; opacity: 1; transition: opacity .4s ease;
+  }
+  #wakeOverlay.show { display: flex; }
+  #wakeOverlay.hide { opacity: 0; }
+  #wakeOverlay .wsp {
+    width: 26px; height: 26px; border: 3px solid #d3d1c7; border-top-color: #6b7078;
+    border-radius: 50%; animation: spin 1s linear infinite;
+  }
+  #wakeOverlay .wl { font-size: 14px; font-weight: 600; letter-spacing: .4px; color: #3a3f47; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* --- 3D device view -------------------------------------------------- */
+  .controls button {
+    background: #2c313a; color: #e7ebf0; border: 1px solid #3a414b;
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; font-family: inherit;
+    cursor: pointer;
+  }
+  .controls button:hover { background: #353b45; }
+  .controls button[aria-pressed="true"] { background: #2d4373; border-color: #4d6bb3; color: #fff; }
+  /* Grows to eat every row the header and legend leave behind, so the scene is
+     as tall as the window allows instead of sitting in a fixed box with dead
+     space above and below it.
+     flex-basis MUST be 0, not auto: the WebGL canvas is sized from the host's
+     own client box, so a content-derived basis would make host height depend on
+     the canvas and the canvas depend on the host. Basis 0 + grow makes the
+     height come purely from the leftover column space. The canvas is also taken
+     out of flow (see cp3d.js) so it can never feed back into this measurement. */
+  #stage3d {
+    display: none; position: relative; width: min(96vw, 720px);
+    flex: 1 1 0; min-height: 280px; align-self: center;
+    touch-action: none; cursor: grab;
+  }
+  #stage3d:active { cursor: grabbing; }
+  body.mode3d #stage3d { display: block; }
+  body.mode3d .device { display: none; }
+  /* In 3D the SDL canvas must keep rendering -- it owns the WebGL context and
+     the firmware's present path -- so it is moved offstage rather than hidden.
+     display:none would risk the context being dropped. It keeps its real size
+     so getBoundingClientRect stays valid for forwarded pointer events. */
+  body.mode3d .device.offstage {
+    display: block; position: fixed; left: -10000px; top: 0;
+    pointer-events: none;
+  }
+  /* The wake splash lives inside the (offstage) 2D device, so in 3D it has to be
+     re-anchored to the viewport or waking looks like the model vanished. Fixed
+     positioning escapes the offstage parent; that parent must therefore not be
+     hidden with opacity, which would take this with it. */
+  body.mode3d #wakeOverlay {
+    position: fixed; inset: auto; left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    width: 210px; height: 150px; border-radius: 10px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.45);
+  }
+  #hint3d {
+    position: absolute; left: 0; right: 0; bottom: 4px; text-align: center;
+    font-size: 11px; color: #6f7681; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div id="title">
+    <b>CrossPoint Reader — running in your browser</b><br />
+    <span>The actual e-reader firmware, compiled to WebAssembly &middot; portrait <span id="dims">&mdash;</span> &middot; read-only library &middot; networking off</span>
+    <div class="controls">
+      <label for="modelSel">Device</label>
+      <select id="modelSel"><option>loading&hellip;</option></select>
+      <button id="view3d" type="button" aria-pressed="false" title="Project the live panel onto the device model">3D view</button>
+      <span id="note"></span>
+    </div>
+  </div>
+  <div class="device" id="device">
+    <canvas id="canvas" width="480" height="800" tabindex="0"
+            oncontextmenu="event.preventDefault()"></canvas>
+    <div id="spinner" class="spinner"></div>
+    <div id="wakeOverlay"><div class="wsp"></div><div class="wl">Waking&hellip;</div></div>
+  </div>
+  <div id="stage3d"><div id="hint3d">drag the screen to swipe &middot; drag off it to orbit &middot; click the rockers &amp; side buttons &middot; scroll to zoom</div></div>
+  <div class="legend" id="legend"></div>
+  <div id="status">preparing WebAssembly&hellip;</div>
+  <script>
+    var statusEl = document.getElementById('status');
+    var spinnerEl = document.getElementById('spinner');
+    var canvasEl = document.getElementById('canvas');
+
+    // --- Wake bridge ----------------------------------------------------
+    // A device "wake" in the web build is a full page reload (see
+    // cpweb_persist_and_reload). Without this, the panel would flash blank
+    // while the WASM runtime and in-memory filesystem re-initialise. If the
+    // previous page set the wake flag, hold a paper "Waking…" splash over the
+    // panel and drop it when the firmware paints its first frame.
+    (function () {
+      var ov = document.getElementById('wakeOverlay');
+      var waking = false;
+      try { waking = sessionStorage.getItem('cpweb_waking') === '1'; sessionStorage.removeItem('cpweb_waking'); } catch (e) {}
+      if (waking && ov) ov.classList.add('show');
+      var hidden = false;
+      window.cpwebFirstFrame = function () {
+        // Also the readiness latch for anything that calls into the WASM
+        // exports: before the runtime is initialised those symbols exist as
+        // stubs that abort on call, so "is the function defined?" is not a
+        // safe test. A painted frame proves the runtime is live.
+        window.__cpFirstFrame = true;
+        if (hidden || !ov) return; hidden = true;
+        ov.classList.add('hide');
+        setTimeout(function () { ov.classList.remove('show', 'hide'); }, 450);
+      };
+      // Safety net: never leave the splash stuck if boot stalls.
+      if (waking) setTimeout(window.cpwebFirstFrame, 15000);
+    })();
+
+    // Integer-scale the portrait panel to the largest whole multiple that fits
+    // the current window. Uses the SDL backing-store size (canvas.width/height,
+    // set by the firmware's window) so it also follows runtime orientation flips.
+    function fitPanel() {
+      var dpr = window.devicePixelRatio || 1;
+      var nativeW = Math.max(1, Math.round((canvasEl.width || 480) / dpr));
+      var nativeH = Math.max(1, Math.round((canvasEl.height || 800) / dpr));
+      var title = document.getElementById('title');
+      var legend = document.getElementById('legend');
+      // Vertical/horizontal chrome around the panel (title + legend + paddings).
+      var chromeH = (title ? title.offsetHeight : 0) + (legend ? legend.offsetHeight : 0) + 56;
+      var availW = window.innerWidth - 20;
+      var availH = window.innerHeight - chromeH;
+      var scale = Math.min(availW / nativeW, availH / nativeH);
+      scale = Math.max(1, Math.floor(scale)); // integer increments, min 1x
+      canvasEl.style.width = (nativeW * scale) + 'px';
+      canvasEl.style.height = (nativeH * scale) + 'px';
+    }
+    // Recompute whenever the backing store or the window size changes.
+    var lastKey = '';
+    function watch() {
+      var key = canvasEl.width + 'x' + canvasEl.height + '@' +
+                window.innerWidth + 'x' + window.innerHeight + '@' +
+                (window.devicePixelRatio || 1);
+      if (key !== lastKey) { lastKey = key; fitPanel(); }
+      requestAnimationFrame(watch);
+    }
+    window.addEventListener('resize', fitPanel);
+    requestAnimationFrame(watch);
+
+    // --- Loose-file filesystem loader -----------------------------------
+    // The SD-card tree (fonts/books/dictionaries) is served as individual
+    // static files listed in manifest.json, NOT baked into a .data package
+    // (Cloudflare Pages caps a single asset at 25 MiB). Eager files (fonts,
+    // books) are written into MEMFS before main() via an Emscripten run
+    // dependency; deferred files (dictionaries) stream in the background after
+    // boot and are picked up lazily when the user opens Settings.
+    window.fsLoad = { eagerPct: 0, deferTotal: 0, deferDone: 0, ready: false, error: null };
+
+    function fsWrite(path, u8) {
+      var slash = path.lastIndexOf('/');
+      var dir = slash > 0 ? path.substring(0, slash) : '/';
+      try { Module.FS.mkdirTree(dir); } catch (e) {}
+      Module.FS.writeFile(path, u8);
+    }
+
+    function fsFetch(entry) {
+      var urls = entry.parts || [entry.url];   // {parts:[...]} => concatenate
+      return Promise.all(urls.map(function (u) {
+        return fetch(u, { cache: 'force-cache' }).then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + u);
+          return r.arrayBuffer();
+        });
+      })).then(function (bufs) {
+        var len = bufs.reduce(function (a, b) { return a + b.byteLength; }, 0);
+        var out = new Uint8Array(len), off = 0;
+        bufs.forEach(function (b) { out.set(new Uint8Array(b), off); off += b.byteLength; });
+        fsWrite(entry.path, out);
+      });
+    }
+
+    function fsManifest() {
+      return fetch('manifest.json', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : { files: [] }; })
+        .then(function (m) { return (m && m.files) || []; });
+    }
+
+    // Eager pass: blocks main() until fonts/books are in MEMFS (fonts are
+    // discovered at boot). Sequential keeps memory flat + progress monotonic.
+    function fsLoadEager() {
+      return fsManifest().then(function (files) {
+        window.__fsAll = files;
+        var eager = files.filter(function (f) { return !f.defer; });
+        window.__fsDeferred = files.filter(function (f) { return f.defer; });
+        var total = eager.reduce(function (a, f) { return a + (f.size || 0); }, 0) || 1;
+        var loaded = 0;
+        return eager.reduce(function (p, f) {
+          return p.then(function () {
+            return fsFetch(f).then(function () {
+              loaded += (f.size || 0);
+              window.fsLoad.eagerPct = Math.round(loaded / total * 100);
+              if (Module.setStatus) Module.setStatus('Loading filesystem\u2026 ' + window.fsLoad.eagerPct + '%');
+            });
+          });
+        }, Promise.resolve());
+      });
+    }
+
+    // Deferred pass: runs after boot; dictionaries land while the user reads,
+    // and DictionaryRegistry::discover (opened from Settings) finds them then.
+    function fsLoadDeferred() {
+      var d = window.__fsDeferred || [];
+      window.fsLoad.deferTotal = d.length;
+      if (!d.length) { window.fsLoad.ready = true; return; }
+      d.reduce(function (p, f) {
+        return p.then(function () { return fsFetch(f).then(function () { window.fsLoad.deferDone++; }); });
+      }, Promise.resolve()).then(function () {
+        window.fsLoad.ready = true;
+        console.log('[fs] deferred assets ready (' + d.length + ' files)');
+      }).catch(function (e) { window.fsLoad.error = String(e); console.error('[fs] deferred load failed', e); });
+    }
+
+    // --- First-visit default state (seed) -------------------------------
+    // The firmware's runtime state (/.crosspoint: settings, recent list, cover
+    // thumbnails) lives in IDBFS, which starts empty for a new visitor. Ship a
+    // configured default (Lyra Extended theme, recents + covers, font /
+    // dictionary / sleep preset) as seed.json and apply it ONCE, when IDBFS has
+    // no settings.json. Returning visitors keep their own state untouched.
+    function cpwebSeedIfEmpty(done) {
+      var FS = Module.FS;
+      var seeded = false;
+      try { seeded = FS.analyzePath('/fs_/.crosspoint/settings.json').exists; } catch (e) {}
+      if (seeded) { done(); return; }  // returning visitor — never overwrite
+      fetch('seed.json', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (seed) {
+          if (!seed || !seed.files) { done(); return; }
+          var n = 0;
+          Object.keys(seed.files).forEach(function (rel) {
+            try {
+              var bin = atob(seed.files[rel]);
+              var u8 = new Uint8Array(bin.length);
+              for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+              var path = '/fs_/.crosspoint/' + rel;
+              FS.mkdirTree(path.substring(0, path.lastIndexOf('/')));
+              FS.writeFile(path, u8);
+              n++;
+            } catch (e) { console.error('[seed] write failed: ' + rel, e); }
+          });
+          FS.syncfs(false, function (err) {
+            if (err) console.error('[seed] persist failed', err);
+            else console.log('[seed] applied default state (' + n + ' files)');
+            done();
+          });
+        })
+        .catch(function (e) { console.error('[seed] fetch failed', e); done(); });
+    }
+
+    // Emscripten reads a global `Module`. Define it before injecting <model>.js.
+    window.Module = {
+      canvas: (function () {
+        canvasEl.addEventListener('webglcontextlost', function (e) {
+          statusEl.textContent = 'Graphics context lost — reload the page.';
+          e.preventDefault();
+        }, false);
+        return canvasEl;
+      })(),
+      print: function (t) { console.log(t); },
+      printErr: function (t) { console.error(t); },
+      setStatus: function (t) {
+        if (!statusEl) return;
+        if (t) { statusEl.textContent = t; spinnerEl.style.display = 'block'; }
+        else { statusEl.textContent = ''; spinnerEl.style.display = 'none'; }
+      },
+      preRun: [function () {
+        // Persist the firmware's runtime state tree (/.crosspoint: reading
+        // position, section caches, settings) across sleep/wake page reloads via
+        // IDBFS (IndexedDB). A web "wake" is a page reload, so this restores
+        // state exactly as the device restores from SD after a power-wake.
+        // Mounted before main() and populated (syncfs true) while a run
+        // dependency holds startup. Degrades gracefully if IndexedDB is blocked.
+        Module.addRunDependency('fs-idbfs');
+        try {
+          Module.FS.mkdirTree('/fs_/.crosspoint');
+          Module.FS.mount(Module.FS.filesystems.IDBFS, {}, '/fs_/.crosspoint');
+          Module.FS.syncfs(true, function (err) {
+            if (err) console.error('[idbfs] initial load failed', err);
+            cpwebSeedIfEmpty(function () { Module.removeRunDependency('fs-idbfs'); });
+          });
+        } catch (e) {
+          console.error('[idbfs] mount failed (state will not persist)', e);
+          Module.removeRunDependency('fs-idbfs');
+        }
+
+        // Populate MEMFS from loose static files before main() runs. The run
+        // dependency holds startup until the eager (font/book) set is written.
+        Module.addRunDependency('fs-loose');
+        fsLoadEager().then(function () {
+          Module.removeRunDependency('fs-loose');
+        }).catch(function (e) {
+          window.fsLoad.error = String(e);
+          console.error('[fs] eager load failed', e);
+          if (Module.setStatus) Module.setStatus('Filesystem load failed: ' + e.message);
+          Module.removeRunDependency('fs-loose'); // boot anyway (empty FS)
+        });
+      }],
+      onRuntimeInitialized: function () { canvasEl.focus(); fitPanel(); fsLoadDeferred(); }
+    };
+
+    // Keep keyboard focus on the panel; stop arrows/space from scrolling the page.
+    // Skip the refocus when the click landed on a real control -- stealing focus
+    // out of an open <select> collapses its dropdown before you can pick an item.
+    window.addEventListener('click', function (e) {
+      if (e.target && e.target.closest && e.target.closest('select, button, input, a, label')) return;
+      canvasEl.focus();
+    });
+    window.addEventListener('keydown', function (e) {
+      // Don't hijack arrows while a form control has focus, or the device
+      // dropdown can't be keyboard-navigated.
+      var a = document.activeElement;
+      if (a && a.closest && a.closest('select, button, input, a')) return;
+      if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].indexOf(e.key) !== -1) {
+        e.preventDefault();
+      }
+    }, { passive: false });
+
+    // Flush the IDBFS-backed /.crosspoint state to IndexedDB when the tab is
+    // hidden or closed, so your reading position survives a plain tab close as
+    // it would on the device (which writes progress to SD continuously). The
+    // explicit sleep/wake path persists on its own before reloading.
+    var __cpwebSyncing = false;
+    function cpwebSyncState() {
+      if (__cpwebSyncing || !window.Module || !Module.FS || !Module.FS.syncfs) return;
+      __cpwebSyncing = true;
+      try {
+        Module.FS.syncfs(false, function (err) {
+          __cpwebSyncing = false;
+          if (err) console.error('[idbfs] background save failed', err);
+        });
+      } catch (e) { __cpwebSyncing = false; }
+    }
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') cpwebSyncState();
+    });
+
+    function buildLegend(model) {
+      var L = document.getElementById('legend');
+      var html =
+        '<span><kbd>&larr;</kbd> <kbd>&rarr;</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <b>navigate / turn pages</b></span>' +
+        '<span><kbd>Enter</kbd> <b>select / open</b></span>' +
+        '<span><kbd>Esc</kbd> <b>back</b></span>' +
+        '<span><kbd>H</kbd> <b>home</b></span>' +
+        '<span><kbd>P</kbd> <b>power</b></span>' +
+        '<span><kbd>S</kbd> <b>sleep</b></span>';
+      if (model.touch) {
+        html += '<span><b style="color:#7aa2f7">Click</b> = tap &middot; <b style="color:#7aa2f7">drag</b> = swipe</span>';
+      }
+      L.innerHTML = html;
+    }
+
+    function buildSelector(models, current) {
+      var sel = document.getElementById('modelSel');
+      sel.innerHTML = models.map(function (m) {
+        return '<option value="' + m.id + '"' + (m.id === current.id ? ' selected' : '') +
+               '>' + m.label + (m.touch ? ' (touch)' : '') + '</option>';
+      }).join('');
+      sel.onchange = function () {
+        var p = new URLSearchParams(location.search);
+        p.set('model', sel.value);
+        location.search = p.toString(); // reload with the chosen model
+      };
+      document.getElementById('note').textContent = current.note || '';
+      document.getElementById('dims').textContent = current.w + '\u00d7' + current.h;
+      document.title = 'CrossPoint Reader — ' + current.label;
+    }
+
+    // Load the model list, wire the UI, then inject the selected WASM bundle.
+    fetch('models.json', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (models) {
+        if (!models || !models.length) { throw new Error('empty'); }
+        var want = new URLSearchParams(location.search).get('model');
+        var model = null;
+        for (var i = 0; i < models.length; i++) {
+          if (models[i].id === want) { model = models[i]; break; }
+        }
+        if (!model) { model = models[0]; }
+
+        buildSelector(models, model);
+        buildLegend(model);
+        canvasEl.width = model.w;
+        canvasEl.height = model.h;
+        fitPanel();
+
+        var s = document.createElement('script');
+        s.src = model.id + '.js';
+        s.async = true;
+        s.onerror = function () {
+          statusEl.textContent = 'Failed to load ' + s.src +
+            ' — run: python build.py model ' + model.id;
+        };
+        document.body.appendChild(s);
+      })
+      .catch(function () {
+        statusEl.textContent =
+          'No model bundles found. Build them with: python build.py all';
+      });
+  </script>
+
+  <!-- 3D device view. Loaded as a module so it can be tree-shaken out of the
+       2D path entirely: nothing here runs, and three.js is never fetched,
+       unless the user actually presses the button. -->
+  <script type="importmap">
+    { "imports": { "three": "./three/three.module.min.js" } }
+  </script>
+  <script type="module">
+    const btn = document.getElementById('view3d');
+    const stage = document.getElementById('stage3d');
+    const deviceEl = document.getElementById('device');
+    const canvasEl = document.getElementById('canvas');
+    let dev = null, loading = false;
+
+    function setNote(t) { document.getElementById('note').textContent = t || ''; }
+
+    // Forward a pointer on the 3D panel to the same spot on the real SDL canvas.
+    // This reuses the existing mouse->touch mapping instead of adding another
+    // WASM export: the canvas is offstage but still laid out, so its bounding
+    // rect is valid and SDL's own listeners do the rest.
+    //
+    // The 'mousemove' is not optional. SDL_SendMouseButton carries no
+    // coordinates -- HalGPIO reads e.button.x/y, which SDL fills from the
+    // position it cached from the last SDL_MOUSEMOTION. Send a bare mousedown
+    // and the tap lands wherever the pointer happened to be beforehand.
+    function forwardToCanvas(type, uv) {
+      const r = canvasEl.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      canvasEl.dispatchEvent(new MouseEvent(type, {
+        clientX: r.left + uv.x * r.width,
+        clientY: r.top + (1 - uv.y) * r.height,
+        bubbles: true, cancelable: true, view: window, button: 0,
+        buttons: type === 'mouseup' ? 0 : 1,
+      }));
+    }
+
+    // Physical buttons go in as keystrokes, which HalGPIO already maps to
+    // BTN_*. `code` is what matters: SDL's Emscripten backend derives its
+    // scancode from it. Holding the pointer holds the button, so long-press
+    // (power off, etc.) works as it does on the real device.
+    function forwardKey(type, b) {
+      canvasEl.dispatchEvent(new KeyboardEvent(type, {
+        key: b.key, code: b.code, keyCode: b.keyCode, which: b.keyCode,
+        bubbles: true, cancelable: true, view: window,
+      }));
+    }
+
+    async function enable3d() {
+      if (dev || loading) return;
+      loading = true;
+      setNote('loading 3D\u2026');
+      try {
+        const { Device3D } = await import('./three/cp3d.js');
+        dev = new Device3D(stage, { fbW: 800, fbH: 480 });
+        window.__dev3d = dev;   // handy for calibration from the console
+        const info = await dev.load((m) => setNote(m));
+        dev.start();
+        setNote(info.tris.toLocaleString() + ' tris');
+
+        // Pointer routing. These sit on the stage in the *capture* phase so they
+        // run before OrbitControls, which listens on the renderer canvas
+        // underneath. Swallowing the event there is what stops a swipe across
+        // the glass from also spinning the model: anything that misses the
+        // panel and the buttons is left alone and orbits as usual.
+        let drag = null;
+        const onDown = (e) => {
+          const hit = dev.pick(e.clientX, e.clientY);
+          if (!hit) return;                  // off the device -> orbit
+          e.stopPropagation();
+          e.preventDefault();
+          try { stage.setPointerCapture(e.pointerId); } catch (_) {}
+          if (hit.kind === 'button') {
+            drag = { kind: 'button', button: hit.button, mesh: hit.mesh };
+            dev.setButtonActive(hit.mesh, true);
+            forwardKey('keydown', hit.button);
+          } else {
+            drag = { kind: 'screen', last: hit.uv };
+            forwardToCanvas('mousemove', hit.uv);
+            forwardToCanvas('mousedown', hit.uv);
+          }
+        };
+        const onMove = (e) => {
+          if (!drag) return;
+          e.stopPropagation();
+          if (drag.kind !== 'screen') return;
+          const uv = dev.projectToPanel(e.clientX, e.clientY);
+          if (uv) { drag.last = uv; forwardToCanvas('mousemove', uv); }
+        };
+        const onUp = (e) => {
+          if (!drag) return;
+          e.stopPropagation();
+          if (drag.kind === 'button') {
+            forwardKey('keyup', drag.button);
+            dev.setButtonActive(drag.mesh, false);
+          } else {
+            const uv = dev.projectToPanel(e.clientX, e.clientY) || drag.last;
+            if (uv) forwardToCanvas('mouseup', uv);
+          }
+          try { stage.releasePointerCapture(e.pointerId); } catch (_) {}
+          drag = null;
+        };
+        stage.addEventListener('pointerdown', onDown, true);
+        stage.addEventListener('pointermove', onMove, true);
+        stage.addEventListener('pointerup', onUp, true);
+        stage.addEventListener('pointercancel', onUp, true);
+      } catch (err) {
+        console.error('[3d] failed', err);
+        setNote('3D failed: ' + err.message);
+        dev = null;
+      } finally { loading = false; }
+    }
+
+    function apply(on) {
+      document.body.classList.toggle('mode3d', on);
+      deviceEl.classList.toggle('offstage', on);
+      btn.setAttribute('aria-pressed', String(on));
+      btn.textContent = on ? '2D view' : '3D view';
+      if (on) { enable3d().then(() => { if (dev) { dev.start(); dev.resize(); } }); }
+      else { if (dev) dev.stop(); setNote(''); }
+      // Keep keystrokes going to the reader in either mode.
+      canvasEl.focus({ preventScroll: true });
+      window.__mode3d = on;
+
+      // A device "wake" is a full page reload, so the chosen view has to live in
+      // the URL or waking always drops you back into 2D.
+      try {
+        const u = new URL(location.href);
+        if (on) u.searchParams.set('view', '3d');
+        else u.searchParams.delete('view');
+        history.replaceState(null, '', u);
+      } catch (_) {}
+    }
+
+    btn.addEventListener('click', () => apply(btn.getAttribute('aria-pressed') !== 'true'));
+    if (new URLSearchParams(location.search).get('view') === '3d') {
+      apply(true);
+    }
+    window.__enable3d = () => apply(true);
+  </script>
+</body>
+</html>
