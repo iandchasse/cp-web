@@ -32,6 +32,11 @@ time. That is what keeps a clone fast despite a 157 MB output.
 
 - **`emsdk/`** (~2 GB) — reinstalled from `EMSDK_VERSION` in `pins.env`.
 - **`firmware/`, `simulator/`** — upstream repos, cloned at the pinned SHAs.
+  `bootstrap.ps1` and CI both clone them *inside* this repo (they are
+  gitignored); `build.py` also accepts them as siblings, which is how the
+  original local workspace was laid out.
+- **`thirdparty/ArduinoJson.h`** — single-header amalgamation, downloaded at
+  `ARDUINOJSON_VERSION` and checksum-verified against `ARDUINOJSON_SHA256`.
 - **`fs_/`** (~134 MB) — books, fonts and dictionaries. Published as a release
   asset (`FS_CONTENT_TAG`) because it is large, binary, and changes far less
   often than the code.
@@ -123,3 +128,18 @@ conflicts, resolve it in `simulator/` and re-export with `git -C simulator diff`
 
 Enable it once under *Settings → Pages → Source: GitHub Actions*, and publish
 the SD tree once with `pwsh scripts/pack-fs.ps1 -Upload`.
+
+Until that release exists the workflow still succeeds: it builds the code, warns
+that the SD tree is missing, and skips publishing rather than deploying a
+library with no books in it.
+
+Two things the runner is picky about, both handled but easy to reintroduce:
+
+- `$GITHUB_ENV` accepts **only** `KEY=VALUE`. Piping `pins.env` into it whole
+  fails on the comments with "Invalid format", so the workflow filters with
+  `grep -E '^[A-Z0-9_]+='` and strips CR with `tr -d '\r'`. Keep the `0-9` in
+  the character class — keys like `ARDUINOJSON_SHA256` are dropped without it,
+  and a dropped pin surfaces as a confusing failure much later in the run.
+- `.gitattributes` forces LF for `pins.env` and marks `*.patch` as `-text`. A
+  CRLF committed from Windows would otherwise put a stray `\r` in
+  `FIRMWARE_REF` and break `git checkout`, or corrupt the patch context lines.

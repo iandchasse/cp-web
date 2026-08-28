@@ -1,0 +1,18 @@
+# These files are consumed by Linux CI, so they must land in the repo with LF
+# regardless of how they were edited on Windows. A stray CR in pins.env rides
+# into $GITHUB_ENV and breaks `git checkout $FIRMWARE_REF` with a confusing
+# "pathspec did not match" error.
+* text=auto eol=lf
+
+# Never touch the patch: git apply matches context lines byte-for-byte, so any
+# line-ending rewrite can make it fail to apply.
+*.patch -text
+
+# Windows-side tooling keeps CRLF.
+*.ps1 text eol=crlf
+
+# Binary assets.
+*.3mf   binary
+*.png   binary
+*.wasm  binary
+*.epub  binary

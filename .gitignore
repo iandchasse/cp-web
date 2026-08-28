@@ -13,12 +13,15 @@ fs_/
 firmware/
 simulator/
 emsdk/
+thirdparty/
 
 # Local QA scratch
 shots/
 node_modules/
+__pycache__/
 *.zip
 *.part-*
+fs-content.tar.zst
 
 # One-off CDP debugging scripts from past investigations. Kept on disk, not
 # shipped -- the maintained harness is qa/cdp_3d_input.mjs.

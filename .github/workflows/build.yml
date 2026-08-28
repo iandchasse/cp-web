@@ -1,162 +1,215 @@
 name: build
 
-# Builds the CrossPoint web reader and hosts it from THIS repo's GitHub Pages.
-# The bundle is host-agnostic -- every URL it emits is relative and it falls
-# back to coi-serviceworker.js when a host cannot set COOP/COEP -- so the same
-# dist/ also drops onto Cloudflare Pages, Netlify, S3 or a local folder.
-#
-# Two paths, split on cost:
-#   PRs            -> code-only build (~23 MB, no SD tree). Fast feedback.
-#   main/dispatch  -> full build + deploy to Pages.
-#
-# dist/ is never committed. Pages is served straight from the build artifact,
-# which is what keeps this repo ~6 MB despite a 157 MB output.
-
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
+# A push builds and publishes. A pull request builds the code only (it has no
+# access to the SD-tree release on forks, and there is nothing to publish).
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Only a full build (with the SD tree) is publishable.
     outputs:
-      full: ${{ steps.mode.outputs.full }}
+      deployable: ${{ steps.result.outputs.deployable }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Load pins
-        run: cat pins.env >> "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Decide build mode
         id: mode
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "full=false" >> "$GITHUB_OUTPUT"
+            echo "Pull request: code-only build, no publish."
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
+            echo "Full build with SD content."
           fi
 
-      # Firmware and simulator are upstream repos we do not own, so they are
-      # cloned at an exact SHA rather than vendored. --filter=blob:none keeps
-      # the checkout to seconds without guessing a shallow depth.
-      - name: Checkout firmware
+      # $GITHUB_ENV accepts only KEY=VALUE lines -- comments and blanks make it
+      # abort with "Invalid format". pins.env is documented for humans, so
+      # filter it to the assignments. Note the 0-9 in the class: keys like
+      # ARDUINOJSON_SHA256 contain digits and are silently dropped without it.
+      # The tr strips CR: the file is edited on Windows, and a trailing \r would
+      # ride along into FIRMWARE_REF and break `git checkout`.
+      - name: Load pins
+        run: grep -E '^[A-Z0-9_]+=' pins.env | tr -d '\r' >> "$GITHUB_ENV"
+
+      - name: Validate pins
         run: |
-          git clone --filter=blob:none "$FIRMWARE_REPO" firmware
-          git -C firmware checkout --detach "$FIRMWARE_REF"
+          echo "emsdk=$EMSDK_VERSION firmware=$FIRMWARE_REF simulator=$SIMULATOR_REF"
+          # Catch a mangled or missing pin here, with a clear message, rather
+          # than as a confusing "pathspec did not match" several steps later.
+          for v in EMSDK_VERSION FIRMWARE_REPO FIRMWARE_REF SIMULATOR_REPO SIMULATOR_REF FS_CONTENT_TAG ARDUINOJSON_VERSION ARDUINOJSON_SHA256; do
+            case "${!v}" in
+              "") echo "::error::$v is missing from pins.env"; exit 1 ;;
+              *[![:print:]]*) echo "::error::$v contains stray characters: $(printf '%q' "${!v}")"; exit 1 ;;
+            esac
+          done
 
-      - name: Checkout simulator
-        run: |
-          git clone --filter=blob:none "$SIMULATOR_REPO" simulator
-          git -C simulator checkout --detach "$SIMULATOR_REF"
-
-      # Adds the cp_fb_* framebuffer exports the 3D view samples, and the
-      # sleep/wake shim. Without it the build still links but 3D renders blank.
-      - name: Apply simulator web patch
-        run: git -C simulator apply --verbose ../patches/simulator-web.patch
-
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
 
       - name: Cache emsdk
-        id: emsdk-cache
+        id: cache-emsdk
         uses: actions/cache@v4
         with:
           path: emsdk
-          key: emsdk-${{ env.EMSDK_VERSION }}
+          key: emsdk-${{ runner.os }}-${{ env.EMSDK_VERSION }}
 
       - name: Install emsdk
-        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        if: steps.cache-emsdk.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://github.com/emscripten-core/emsdk.git
-          ./emsdk/emsdk install "$EMSDK_VERSION"
-          ./emsdk/emsdk activate "$EMSDK_VERSION"
+          cd emsdk
+          ./emsdk install "$EMSDK_VERSION"
+          ./emsdk activate "$EMSDK_VERSION"
 
-      # Generated sources, not committed upstream. Skipping these fails the
-      # compile with missing i18n symbols.
-      - name: Firmware codegen
+      - name: Clone firmware
+        run: |
+          git clone --filter=blob:none "$FIRMWARE_REPO" firmware
+          cd firmware
+          git checkout --detach "$FIRMWARE_REF"
+          git submodule update --init --recursive --depth 1
+
+      - name: Clone simulator
+        run: |
+          git clone --filter=blob:none "$SIMULATOR_REPO" simulator
+          cd simulator
+          git checkout --detach "$SIMULATOR_REF"
+
+      # Single-header amalgamation the firmware and the simulator's WString.h
+      # both depend on. Not vendored into this repo; fetched at the pinned
+      # version and checksum-verified.
+      - name: Fetch ArduinoJson
+        run: |
+          set -e
+          mkdir -p thirdparty
+          curl -fsSL -o thirdparty/ArduinoJson.h \
+            "https://github.com/bblanchon/ArduinoJson/releases/download/v${ARDUINOJSON_VERSION}/ArduinoJson-v${ARDUINOJSON_VERSION}.h"
+          echo "${ARDUINOJSON_SHA256}  thirdparty/ArduinoJson.h" | sha256sum -c -
+
+      # The patch carries the cp_fb_* framebuffer exports, the web sleep/wake
+      # shim and the HAL parity fix. Without it the build links but the 3D
+      # panel renders blank -- a SHA pin alone does not capture these.
+      - name: Apply simulator web patch
+        run: |
+          git -C simulator apply --verbose ../patches/simulator-web.patch
+          echo "--- patched files ---"
+          git -C simulator diff --stat
+
+      - name: Generate firmware headers
         working-directory: firmware
         run: |
+          # PlatformIO runs these as pre: extra_scripts. build.py does not, so
+          # they must run here or the compile fails on missing i18n symbols.
           python scripts/gen_i18n.py --strip-unused
           python scripts/build_html.py
 
-      # Incremental objects keyed on the toolchain + upstream pins. A cache hit
-      # turns a ~15 min cold build into ~2 min; build.py uses -MMD depfiles plus
-      # .cmd flag sidecars, so an object is rebuilt when its flags change.
+      # Only reached on push/dispatch. A missing release is not fatal: we fall
+      # back to a code-only build and skip publishing, so first-time setup gets
+      # a green run plus instructions instead of a red X.
+      - name: Fetch SD tree
+        id: fs
+        if: steps.mode.outputs.full == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release download "$FS_CONTENT_TAG" \
+               --repo "$GITHUB_REPOSITORY" \
+               --pattern 'fs-content.tar.zst' \
+               --output fs-content.tar.zst; then
+            mkdir -p fs_
+            tar --zstd -xf fs-content.tar.zst -C fs_
+            rm -f fs-content.tar.zst
+            echo "have=true" >> "$GITHUB_OUTPUT"
+            echo "Restored fs_ ($(du -sh fs_ | cut -f1), $(find fs_ -type f | wc -l) files)"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Release '$FS_CONTENT_TAG' has no fs-content.tar.zst asset. Building code only and skipping publish. Create it with: pwsh scripts/pack-fs.ps1 -Upload"
+          fi
+
       - name: Cache objects
         uses: actions/cache@v4
         with:
           path: obj
           key: obj-${{ env.EMSDK_VERSION }}-${{ env.FIRMWARE_REF }}-${{ env.SIMULATOR_REF }}-${{ hashFiles('build.py', 'patches/*.patch') }}
-          restore-keys: obj-${{ env.EMSDK_VERSION }}-${{ env.FIRMWARE_REF }}-${{ env.SIMULATOR_REF }}-
-
-      # Books, fonts and dictionaries. Kept out of git (large, binary, rarely
-      # changes) and published as a release asset by scripts/pack-fs.ps1.
-      - name: Fetch SD tree
-        if: steps.mode.outputs.full == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "$FS_CONTENT_TAG" --pattern 'fs-content.tar.zst' --output fs.tar.zst
-          mkdir -p fs_
-          tar --zstd -xf fs.tar.zst -C fs_
-          echo "fs_ restored: $(du -sh fs_ | cut -f1)"
 
       - name: Build
         run: |
+          set -e
           source ./emsdk/emsdk_env.sh
-          if [ "${{ steps.mode.outputs.full }}" = "true" ]; then
+          if [ "${{ steps.fs.outputs.have }}" = "true" ]; then
             python build.py all
           else
-            for m in x4 x4pro x3; do python build.py model "$m" --skip-fs; done
-            python build.py page --skip-fs
+            # build.py errors rather than emitting an empty manifest when fs_
+            # is absent, so the skip is explicit.
+            python build.py all --skip-fs
           fi
 
       - name: Check host limits
         run: |
-          # Cloudflare Pages rejects any single asset over 25 MiB. GitHub Pages
-          # has no per-asset cap but a 1 GB site limit; check both so the same
-          # dist stays portable across hosts.
-          big=$(find dist -type f -size +25M)
-          if [ -n "$big" ]; then echo "::error::asset over 25 MiB:"; echo "$big"; exit 1; fi
-          total=$(du -sm dist | cut -f1)
-          echo "dist = ${total} MB, largest asset under 25 MiB"
-          if [ "$total" -gt 1000 ]; then echo "::error::over the 1 GB Pages limit"; exit 1; fi
-          test -f dist/.nojekyll || { echo "::error::missing .nojekyll"; exit 1; }
+          set -e
+          # GitHub Pages runs Jekyll, which silently drops _-prefixed paths.
+          test -f dist/.nojekyll || { echo "::error::dist/.nojekyll missing"; exit 1; }
 
-      - name: Upload dist artifact
+          # Cloudflare Pages rejects any single asset over 25 MiB.
+          big=$(find dist -type f -size +25M)
+          if [ -n "$big" ]; then
+            echo "::error::assets exceed the 25 MiB Cloudflare Pages limit:"
+            echo "$big" | xargs -r ls -lh
+            exit 1
+          fi
+
+          # GitHub Pages caps a site at 1 GB.
+          kb=$(du -sk dist | cut -f1)
+          echo "dist = $((kb / 1024)) MiB, $(find dist -type f | wc -l) files"
+          [ "$kb" -lt 1000000 ] || { echo "::error::dist exceeds the 1 GB GitHub Pages limit"; exit 1; }
+
+      - name: Decide publishability
+        id: result
+        run: |
+          if [ "${{ steps.mode.outputs.full }}" = "true" ] && [ "${{ steps.fs.outputs.have }}" = "true" ]; then
+            echo "deployable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deployable=false" >> "$GITHUB_OUTPUT"
+            echo "Not publishing: this is either a pull request or a build without SD content."
+          fi
+
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: crosspoint-web
           path: dist
-          retention-days: 30
+          retention-days: 7
 
       - name: Upload Pages artifact
-        if: steps.mode.outputs.full == 'true'
+        if: steps.result.outputs.deployable == 'true'
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
 
   deploy:
     needs: build
-    if: needs.build.outputs.full == 'true' && github.event_name != 'pull_request'
+    if: needs.build.outputs.deployable == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - id: deployment
+      - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4

@@ -27,7 +27,15 @@ import concurrent.futures
 import shutil
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-CPWEB = os.path.dirname(ROOT)
+
+# The upstream clones (firmware, simulator, thirdparty) live BESIDE this repo in
+# the original local workspace, but CI clones them INSIDE it -- which is also
+# what .gitignore assumes. Support both, preferring the inside layout, so the
+# same build.py works locally and on a runner.
+CPWEB = os.environ.get("CPWEB_DEPS")
+if not CPWEB:
+    CPWEB = ROOT if os.path.isdir(os.path.join(ROOT, "firmware")) else os.path.dirname(ROOT)
+
 FW = os.path.join(CPWEB, "firmware")
 SIM = os.path.join(CPWEB, "simulator")
 SDK = os.path.join(FW, "freeink-sdk", "libs")

@@ -12,24 +12,44 @@ $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
 # pins.env is plain KEY=VALUE so both bash (CI) and PowerShell can read it.
+# The 0-9 in the class matters: keys like ARDUINOJSON_SHA256 contain digits.
 $pins = @{}
-Get-Content pins.env | Where-Object { $_ -match '^\s*[A-Z_]+=' } | ForEach-Object {
+Get-Content pins.env | Where-Object { $_ -match '^\s*[A-Z0-9_]+=' } | ForEach-Object {
   $k, $v = $_ -split '=', 2
   $pins[$k.Trim()] = $v.Trim()
 }
 $pins.GetEnumerator() | Sort-Object Name | ForEach-Object { "  $($_.Name) = $($_.Value)" }
 
-function Clone-At([string]$url, [string]$dir, [string]$ref) {
+function Clone-At([string]$url, [string]$dir, [string]$ref, [switch]$Submodules) {
   if (-not (Test-Path $dir)) {
     Write-Host "`n[bootstrap] cloning $dir"
     git clone --filter=blob:none $url $dir
   }
   git -C $dir fetch --all --quiet
   git -C $dir checkout --detach $ref
+  if ($Submodules) {
+    # freeink-sdk (and its nested lucide-icons) supply headers the build needs;
+    # without this the compile fails on missing FreeInkUI/Icons includes.
+    git -C $dir submodule update --init --recursive --depth 1
+  }
 }
 
-Clone-At $pins.FIRMWARE_REPO  'firmware'  $pins.FIRMWARE_REF
+Clone-At $pins.FIRMWARE_REPO  'firmware'  $pins.FIRMWARE_REF -Submodules
 Clone-At $pins.SIMULATOR_REPO 'simulator' $pins.SIMULATOR_REF
+
+# Single-header amalgamation the firmware and the simulator's WString.h both
+# depend on. Fetched at the pinned version and checksum-verified.
+if (-not (Test-Path 'thirdparty/ArduinoJson.h')) {
+  Write-Host "`n[bootstrap] fetching ArduinoJson $($pins.ARDUINOJSON_VERSION)"
+  New-Item -ItemType Directory -Force -Path thirdparty | Out-Null
+  $v = $pins.ARDUINOJSON_VERSION
+  Invoke-WebRequest -Uri "https://github.com/bblanchon/ArduinoJson/releases/download/v$v/ArduinoJson-v$v.h" `
+                    -OutFile 'thirdparty/ArduinoJson.h'
+}
+$got = (Get-FileHash 'thirdparty/ArduinoJson.h' -Algorithm SHA256).Hash.ToLower()
+if ($got -ne $pins.ARDUINOJSON_SHA256.ToLower()) {
+  throw "ArduinoJson.h checksum mismatch: got $got, expected $($pins.ARDUINOJSON_SHA256)"
+}
 
 # The web build needs HAL changes that are not upstream (cp_fb_* framebuffer
 # exports for the 3D view, and the sleep/wake shim). Re-applying on an already
