@@ -139,7 +139,7 @@ jobs:
             echo "Restored fs_ ($(du -sh fs_ | cut -f1), $(find fs_ -type f | wc -l) files)"
           else
             echo "have=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Release '$FS_CONTENT_TAG' has no fs-content.tar.zst asset. Building code only and skipping publish. Create it with: pwsh scripts/pack-fs.ps1 -Upload"
+            echo "::warning::Release '$FS_CONTENT_TAG' has no fs-content.tar.zst asset. Building code only and skipping publish. Create it with: powershell -File scripts/pack-fs.ps1 -Upload"
           fi
 
       - name: Cache objects

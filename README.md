@@ -46,7 +46,7 @@ time. That is what keeps a clone fast despite a 157 MB output.
 ## Getting a working tree
 
 ```powershell
-pwsh scripts/bootstrap.ps1 -WithFs
+powershell -File scripts/bootstrap.ps1 -WithFs
 . .\emsdk\emsdk_env.ps1
 python build.py all
 python serve.py
@@ -127,7 +127,8 @@ conflicts, resolve it in `simulator/` and re-export with `git -C simulator diff`
   repo's GitHub Pages.
 
 Enable it once under *Settings → Pages → Source: GitHub Actions*, and publish
-the SD tree once with `pwsh scripts/pack-fs.ps1 -Upload`.
+the SD tree once with `powershell -File scripts/pack-fs.ps1 -Upload`
+(`pwsh` also works if you have PowerShell 7; the scripts target 5.1).
 
 Until that release exists the workflow still succeeds: it builds the code, warns
 that the SD tree is missing, and skips publishing rather than deploying a
