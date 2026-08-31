@@ -77,7 +77,11 @@ const fb = () => js('window.Module && Module._cp_fb_counter ? Module._cp_fb_coun
 // model, so it is the honest way to ask "did the reader actually change?".
 const fbHash = () => js(`(() => {
   const M = window.Module;
-  if (!M || !M._cp_fb_sync) return 'na';
+  // NOTE: testing for _cp_fb_sync is NOT sufficient. Emscripten installs the
+  // exports as stubs that ABORT the module if called before runtime init, so
+  // across a wake reload this would kill the page. __cpFirstFrame is the only
+  // honest readiness signal.
+  if (!M || !M._cp_fb_sync || !window.__cpFirstFrame) return 'na';
   M._cp_fb_sync();
   const ptr = M._cp_fb_ptr(), w = M._cp_fb_width(), h = M._cp_fb_height();
   const src = new Uint8Array(M.HEAPU8.buffer, ptr, w * h * 4);
@@ -176,9 +180,15 @@ async function swipe(u0, v0, u1, v1, label, opts = {}) {
 
 async function key(k, label) {
   const map = { ArrowRight: 39, ArrowLeft: 37, ArrowUp: 38, ArrowDown: 40, Enter: 13, Escape: 27 };
+  // Single letters need an explicit virtual keycode AND a "KeyX"-form code;
+  // passing code:'s' with no keycode dispatches an event SDL never sees.
+  const isLetter = /^[a-z]$/i.test(k);
+  const vk = isLetter ? k.toUpperCase().charCodeAt(0) : map[k];
+  const code = isLetter ? 'Key' + k.toUpperCase() : k;
   const h0 = await fbHash();
-  const common = { key: k, code: k, windowsVirtualKeyCode: map[k], nativeVirtualKeyCode: map[k] };
-  await send('Input.dispatchKeyEvent', { type: 'keyDown', ...common });
+  const common = { key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk };
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', ...common,
+    ...(isLetter ? { text: k } : {}) });
   await sleep(120);
   await send('Input.dispatchKeyEvent', { type: 'keyUp', ...common });
   const h1 = await settle(h0);
@@ -251,6 +261,8 @@ for (const s of steps) {
     const cx = Math.round(r.left + 40);
     const cy = Math.round(r.top + r.height * 0.55);
     const n = s.n || 60;
+    const before = await js('JSON.stringify(window.__dev3d.camera.position)');
+    const t0 = Date.now();
     await mouse('mouseMoved', cx, cy, { buttons: 0 });
     await mouse('mousePressed', cx, cy);
     for (let i = 1; i <= n; i++) {
@@ -260,6 +272,11 @@ for (const s of steps) {
       await sleep(s.gap === undefined ? 8 : s.gap);
     }
     await mouse('mouseReleased', cx, cy);
+    const after = await js('JSON.stringify(window.__dev3d.camera.position)');
+    // Logged because a silent orbitn makes it impossible to tell a real result
+    // from a drag that was too short to have exercised anything.
+    console.log(`   orbitn n=${n} held ${Date.now() - t0} ms:`,
+      before === after ? 'NO MOVEMENT (bad)' : 'camera moved OK');
   }
   if (s.t === 'noorbit') {
     // A drag across the glass must NOT orbit.

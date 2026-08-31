@@ -1,5 +1,5 @@
 diff --git a/src/HalDisplay.cpp b/src/HalDisplay.cpp
-index e3c5caa..d6f2877 100644
+index 2a4a2da..a66a8cb 100644
 --- a/src/HalDisplay.cpp
 +++ b/src/HalDisplay.cpp
 @@ -28,6 +28,12 @@ static uint32_t
@@ -31,7 +31,7 @@ index e3c5caa..d6f2877 100644
    pendingPresent.store(true);
  }
  
-@@ -414,13 +422,13 @@ void HalDisplay::refreshDisplay(RefreshMode /*mode*/, bool /*turnOffScreen*/) {
+@@ -417,13 +425,13 @@ void HalDisplay::refreshDisplay(RefreshMode /*mode*/, bool /*turnOffScreen*/) {
  }
  
  // Called from the main thread (simulator_main.cpp) to push pixels to SDL.
@@ -48,7 +48,7 @@ index e3c5caa..d6f2877 100644
  
    extern GfxRenderer renderer;
    const GfxRenderer::Orientation orientation = renderer.getOrientation();
-@@ -476,6 +484,7 @@ void HalDisplay::presentIfNeeded() {
+@@ -479,6 +487,7 @@ void HalDisplay::presentIfNeeded() {
      captureDueScreenshots();
    }
    SDL_RenderPresent(sdl_renderer);
@@ -56,7 +56,7 @@ index e3c5caa..d6f2877 100644
  }
  
  bool HalDisplay::shouldQuit() const { return quitRequested.load(); }
-@@ -578,3 +587,66 @@ uint16_t HalDisplay::getDisplayWidthBytes() const {
+@@ -581,3 +590,66 @@ uint16_t HalDisplay::getDisplayWidthBytes() const {
  uint32_t HalDisplay::getBufferSize() const { return BUFFER_SIZE; }
  
  HalDisplay display;
@@ -139,7 +139,7 @@ index 0e41f0f..8c25fa6 100644
    bool shouldQuit() const;
  
 diff --git a/src/HalGPIO.cpp b/src/HalGPIO.cpp
-index 2c16cb2..b47651c 100644
+index 96892bd..8bd2493 100644
 --- a/src/HalGPIO.cpp
 +++ b/src/HalGPIO.cpp
 @@ -55,6 +55,11 @@ static bool releasedThisFrame[NUM_BUTTONS] = {};
@@ -154,7 +154,7 @@ index 2c16cb2..b47651c 100644
  
  namespace {
  
-@@ -743,6 +748,17 @@ bool HalGPIO::wasUsbStateChanged() const { return false; }
+@@ -747,6 +752,17 @@ bool HalGPIO::wasUsbStateChanged() const { return false; }
  void HalGPIO::startDeepSleep() {
    clearButtonState();
  
@@ -172,14 +172,12 @@ index 2c16cb2..b47651c 100644
    while (true) {
      processSyntheticEvents();
      if (quitRequested.load())
-@@ -770,9 +786,33 @@ void HalGPIO::startDeepSleep() {
+@@ -774,7 +790,33 @@ void HalGPIO::startDeepSleep() {
  
      SDL_Delay(10);
    }
 +#endif
- }
--bool HalGPIO::verifyPowerButtonWakeup(uint16_t /*requiredDurationMs*/,
--                                      bool /*shortPressAllowed*/) {
++}
 +
 +#ifdef __EMSCRIPTEN__
 +bool HalGPIO::isWebSleepActive() const { return webSleepActive; }
@@ -202,17 +200,17 @@ index 2c16cb2..b47651c 100644
 +    }
 +  }
 +  return false;
-+}
-+#endif
-+bool HalGPIO::verifyPowerButtonWakeup() {
-   return true;
  }
++#endif
++
+ bool HalGPIO::verifyPowerButtonWakeup() { return true; }
  
+ HalGPIO gpio;
 diff --git a/src/HalGPIO.h b/src/HalGPIO.h
-index 22b36bf..f7ee572 100644
+index db53857..f7ee572 100644
 --- a/src/HalGPIO.h
 +++ b/src/HalGPIO.h
-@@ -91,10 +91,23 @@ public:
+@@ -91,6 +91,20 @@ public:
    // Setup wake up GPIO and enter deep sleep
    void startDeepSleep();
  
@@ -232,9 +230,4 @@ index 22b36bf..f7ee572 100644
 +
    // Verify power button was held long enough after wakeup.
    // The host wake path is synthetic, so verification always succeeds.
--  bool verifyPowerButtonWakeup(uint16_t requiredDurationMs,
--                               bool shortPressAllowed);
-+  bool verifyPowerButtonWakeup();
- 
-   // Check if USB is connected
-   bool isUsbConnected() const;
+   bool verifyPowerButtonWakeup();

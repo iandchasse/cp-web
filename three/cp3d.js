@@ -101,7 +101,8 @@ export class Device3D {
     const h = this.host.clientHeight || 900;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));    this.renderer.setSize(w, h, false);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    this.renderer.setSize(w, h, false);
     // Out of flow on purpose: the host's height comes from flex, and the canvas
     // is sized from the host, so leaving it in flow would be circular.
     this.renderer.domElement.style.cssText =
@@ -145,29 +146,34 @@ export class Device3D {
     // update()'s return value: damping means the camera keeps moving after the
     // pointer is released, and 'change' is what OrbitControls fires for both.
     this._dirty = true;
-    this._lastChange = 0;
-    this.controls.addEventListener('change', () => {
-      this._dirty = true;
-      this._lastChange = performance.now();
-    });
+    this.controls.addEventListener('change', () => { this._dirty = true; });
 
-    // ---- Adaptive resolution while moving ----------------------------------
-    // During motion every frame is legitimately dirty, so on-demand rendering
-    // cannot help there; the only lever left is pixels (the scene is fill-bound
-    // -- quartering the pixel count roughly halved the frame cost).
+    // ---- Why there is NO adaptive resolution here ---------------------------
+    // A previous version stepped the pixel ratio down (1 -> 0.75 -> 0.5) while
+    // the camera moved, driven by an EMA of the frame delta. It was removed
+    // because the control loop was unsound in two separate ways:
     //
-    // Driven by *measured* frame time rather than a fixed factor, because the
-    // right answer is hardware dependent: a machine that already holds 60 fps
-    // should never be blurred, while a slow one needs the help. Resolution only
-    // steps down while motion is actually costing frames, and always returns to
-    // full once it settles -- so the still image is never degraded.
-    this._fullPR = Math.min(window.devicePixelRatio || 1, 2);
-    this._scale = 1;          // fraction of _fullPR currently being rendered
-    this._frameEma = null;
-    this._lastRenderT = 0;
-    this._dragging = false;
-    this.controls.addEventListener('start', () => { this._dragging = true; });
-    this.controls.addEventListener('end', () => { this._dragging = false; });
+    // 1. WRONG SIGNAL. The frame delta it measured is wall-clock time between
+    //    rendered frames on a main thread SHARED with Emscripten's main_tick
+    //    (the firmware). The firmware alone floors that delta well above the
+    //    22 ms trip point, and no amount of shrinking our drawing buffer can
+    //    move it. So the loop never saw the improvement it was waiting for and
+    //    ratcheted straight to the 0.5 floor -- and because it only restored
+    //    resolution once motion STOPPED, a sustained orbit could only ever step
+    //    down. That is the "goes pixely after a couple of seconds" report.
+    //
+    // 2. THE CURE CAUSED THE DISEASE. Each step called setPixelRatio + setSize,
+    //    which reallocates the drawing buffer, the depth buffer and (antialias
+    //    is on) the MSAA buffers, synchronously, mid-drag. One orbit gesture
+    //    paid up to three of those stalls.
+    //
+    // The original "quartering the pixels halves the frame cost" measurement
+    // was taken on the SwiftShader QA box -- a CPU rasterizer, pathologically
+    // fill-bound. On a real GPU this scene is 9 draw calls and ~64k triangles,
+    // so there is nothing to reclaim and the reallocations are pure loss.
+    // If a genuinely fill-bound machine ever needs help, the only sound signal
+    // is the DIFFERENCE between frame deltas with and without our render (the
+    // on-demand loop below already produces both), not the absolute delta.
 
     this._buildPanelTexture();
     this._onResize = () => this.resize();
@@ -558,33 +564,8 @@ export class Device3D {
       if (this.syncPanel()) this._dirty = true;
       this.controls.update();
 
-      const now = performance.now();
-      // Damping keeps the camera moving after the pointer lifts, and the lower
-      // the frame rate the longer that tail lasts in wall-clock terms (it
-      // decays per frame, not per second) -- so "moving" has to outlast 'end'.
-      const moving = this._dragging || (now - this._lastChange) < 180;
-      if (!moving && this._scale !== 1) {
-        this._setScale(1);          // motion stopped: put the crisp image back
-        this._frameEma = null;
-      }
-
-      if (!this._dirty) {
-        this._lastRenderT = 0;      // don't count an idle gap as a slow frame
-        return;
-      }
+      if (!this._dirty) return;
       this._dirty = false;
-
-      if (moving && this._lastRenderT) {
-        const dt = now - this._lastRenderT;
-        this._frameEma = this._frameEma === null
-          ? dt : this._frameEma * 0.8 + dt * 0.2;
-        // ~45 fps. Step down only while motion is actually costing frames.
-        if (this._frameEma > 22 && this._scale > 0.5) {
-          this._setScale(this._scale > 0.75 ? 0.75 : 0.5);
-          this._frameEma = null;    // re-measure at the new resolution
-        }
-      }
-      this._lastRenderT = now;
 
       this.renderer.render(this.scene, this.camera);
     };
@@ -594,17 +575,6 @@ export class Device3D {
   // Force a redraw on the next frame. Anything that mutates the scene outside
   // of the camera and the panel must call this, or its change will not appear.
   invalidate() { this._dirty = true; }
-
-  _setScale(s) {
-    if (this._scale === s) return;
-    this._scale = s;
-    const c = this.renderer.domElement;
-    this.renderer.setPixelRatio(this._fullPR * s);
-    // updateStyle=false: the canvas is positioned by CSS (inset:0), so its
-    // layout size must not be touched -- only the drawing buffer.
-    this.renderer.setSize(c.clientWidth, c.clientHeight, false);
-    this._dirty = true;
-  }
 
   stop() {
     if (this._raf) cancelAnimationFrame(this._raf);
