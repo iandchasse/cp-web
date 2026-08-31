@@ -101,8 +101,7 @@ export class Device3D {
     const h = this.host.clientHeight || 900;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    this.renderer.setSize(w, h, false);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));    this.renderer.setSize(w, h, false);
     // Out of flow on purpose: the host's height comes from flex, and the canvas
     // is sized from the host, so leaving it in flow would be circular.
     this.renderer.domElement.style.cssText =
@@ -133,6 +132,42 @@ export class Device3D {
     this.controls.dampingFactor = 0.08;
     this.controls.enablePan = false;
     this.controls.rotateSpeed = 0.55;
+
+    // ---- On-demand rendering ----------------------------------------------
+    // The scene is static apart from the panel and the camera, so rendering
+    // every frame regardless was burning fill rate continuously. Measured on
+    // the SwiftShader QA box: stopping the render loop took the frame delta
+    // from 117 ms to 50 ms, while renderer.render() itself only costs ~0.6 ms
+    // of CPU -- i.e. the cost is raster, not draw calls, and it was being paid
+    // even when the image was identical.
+    //
+    // Deliberately driven off the controls' own 'change' event rather than
+    // update()'s return value: damping means the camera keeps moving after the
+    // pointer is released, and 'change' is what OrbitControls fires for both.
+    this._dirty = true;
+    this._lastChange = 0;
+    this.controls.addEventListener('change', () => {
+      this._dirty = true;
+      this._lastChange = performance.now();
+    });
+
+    // ---- Adaptive resolution while moving ----------------------------------
+    // During motion every frame is legitimately dirty, so on-demand rendering
+    // cannot help there; the only lever left is pixels (the scene is fill-bound
+    // -- quartering the pixel count roughly halved the frame cost).
+    //
+    // Driven by *measured* frame time rather than a fixed factor, because the
+    // right answer is hardware dependent: a machine that already holds 60 fps
+    // should never be blurred, while a slow one needs the help. Resolution only
+    // steps down while motion is actually costing frames, and always returns to
+    // full once it settles -- so the still image is never degraded.
+    this._fullPR = Math.min(window.devicePixelRatio || 1, 2);
+    this._scale = 1;          // fraction of _fullPR currently being rendered
+    this._frameEma = null;
+    this._lastRenderT = 0;
+    this._dragging = false;
+    this.controls.addEventListener('start', () => { this._dragging = true; });
+    this.controls.addEventListener('end', () => { this._dragging = false; });
 
     this._buildPanelTexture();
     this._onResize = () => this.resize();
@@ -183,8 +218,16 @@ export class Device3D {
       if (!g.attributes.normal) g.computeVertexNormals();
       tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
       // Replace the model's flat #9DCFED with something that reads as a device.
-      n.material = new THREE.MeshStandardMaterial({
-        color: 0x3c4149, roughness: 0.62, metalness: 0.25,
+      //
+      // Phong rather than Standard: the scene is fill-bound (one mesh covering
+      // most of the viewport, only 9 draw calls), so the body's fragment shader
+      // is the dominant cost. Measured at 1.5x faster overall than the PBR
+      // material -- and with a single flat colour, no maps and computed
+      // normals, there is nothing for PBR to express: a pixel diff of the two
+      // renders came out 90.7% identical, with 0.008% of pixels differing by
+      // more than 24/255 (confined to specular highlight edges).
+      n.material = new THREE.MeshPhongMaterial({
+        color: 0x3c4149, shininess: 25, specular: 0x2a2f36,
         vertexColors: false,
       });
     });
@@ -332,6 +375,7 @@ export class Device3D {
   setButtonActive(mesh, on) {
     if (!mesh) return;
     mesh.material.opacity = on ? 0.45 : (this._hints ? 0.22 : 0);
+    this._dirty = true;
   }
 
   // Reveal every hitbox at once. The front rockers are placed by hand (the model
@@ -340,6 +384,7 @@ export class Device3D {
   showButtonHints(on) {
     this._hints = !!on;
     for (const m of this.buttons || []) m.material.opacity = on ? 0.22 : 0;
+    this._dirty = true;
   }
 
   // Inverse of pick(): where a given panel coordinate, or a named button, lands
@@ -493,6 +538,7 @@ export class Device3D {
       this._frameCamera(this.modelSize);
       this._reframing = false;
     }
+    this._dirty = true;
   }
 
   resetView() {
@@ -506,11 +552,58 @@ export class Device3D {
     if (this._raf) return;
     const tick = () => {
       this._raf = requestAnimationFrame(tick);
-      this.syncPanel();
+      // Both of these are cheap and must run every frame regardless: syncPanel
+      // early-outs on an unchanged frame counter, and controls.update() is the
+      // thing that advances damping (and fires 'change', setting _dirty).
+      if (this.syncPanel()) this._dirty = true;
       this.controls.update();
+
+      const now = performance.now();
+      // Damping keeps the camera moving after the pointer lifts, and the lower
+      // the frame rate the longer that tail lasts in wall-clock terms (it
+      // decays per frame, not per second) -- so "moving" has to outlast 'end'.
+      const moving = this._dragging || (now - this._lastChange) < 180;
+      if (!moving && this._scale !== 1) {
+        this._setScale(1);          // motion stopped: put the crisp image back
+        this._frameEma = null;
+      }
+
+      if (!this._dirty) {
+        this._lastRenderT = 0;      // don't count an idle gap as a slow frame
+        return;
+      }
+      this._dirty = false;
+
+      if (moving && this._lastRenderT) {
+        const dt = now - this._lastRenderT;
+        this._frameEma = this._frameEma === null
+          ? dt : this._frameEma * 0.8 + dt * 0.2;
+        // ~45 fps. Step down only while motion is actually costing frames.
+        if (this._frameEma > 22 && this._scale > 0.5) {
+          this._setScale(this._scale > 0.75 ? 0.75 : 0.5);
+          this._frameEma = null;    // re-measure at the new resolution
+        }
+      }
+      this._lastRenderT = now;
+
       this.renderer.render(this.scene, this.camera);
     };
     this._raf = requestAnimationFrame(tick);
+  }
+
+  // Force a redraw on the next frame. Anything that mutates the scene outside
+  // of the camera and the panel must call this, or its change will not appear.
+  invalidate() { this._dirty = true; }
+
+  _setScale(s) {
+    if (this._scale === s) return;
+    this._scale = s;
+    const c = this.renderer.domElement;
+    this.renderer.setPixelRatio(this._fullPR * s);
+    // updateStyle=false: the canvas is positioned by CSS (inset:0), so its
+    // layout size must not be touched -- only the drawing buffer.
+    this.renderer.setSize(c.clientWidth, c.clientHeight, false);
+    this._dirty = true;
   }
 
   stop() {

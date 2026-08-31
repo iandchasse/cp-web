@@ -4,7 +4,7 @@
 // point is to test the path a user's hand takes.
 //
 //   node cdp_3d_input.mjs <model> <outPrefix>
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 
 const MODEL = process.argv[2] || 'x4pro';
@@ -53,6 +53,14 @@ await send('Runtime.enable');
 const js = async (expr) => {
   const r = await send('Runtime.evaluate',
     { expression: expr, awaitPromise: true, returnByValue: true });
+  // Without this, a throwing/mis-parsed expression silently yields undefined,
+  // which is indistinguishable from an expression that legitimately returns
+  // undefined. That ambiguity has already cost one debug cycle.
+  const ex = r.result?.exceptionDetails;
+  if (ex) {
+    const msg = ex.exception?.description || ex.text || JSON.stringify(ex);
+    throw new Error(`page threw: ${msg}`);
+  }
   return r.result?.result?.value;
 };
 const shot = async (name) => {
@@ -208,6 +216,14 @@ for (const s of steps) {
   }
   if (s.t === 'wait') { await sleep(s.ms || 3000); console.log('   waited', s.ms || 3000, 'ms ->', await fbHash()); }
   if (s.t === 'eval')  { console.log('   eval:', await js(s.js)); await sleep(s.ms || 400); }
+  // Evaluate a whole .js file. Passing large scripts through the STEPS env var
+  // means round-tripping them through PowerShell's JSON encoder, which mangles
+  // multi-line strings; reading from disk sidesteps that entirely.
+  if (s.t === 'evalfile') {
+    console.log('   evalfile:', s.path);
+    console.log(await js(readFileSync(s.path, 'utf8')));
+    await sleep(s.ms || 400);
+  }
   if (s.t === 'tap')   h = await tap(s.u, s.v, s.label);
   if (s.t === 'swipe') h = await swipe(s.u0, s.v0, s.u1, s.v1, s.label, s);
   if (s.t === 'key')   h = await key(s.key, s.label);
@@ -226,6 +242,24 @@ for (const s of steps) {
     await sleep(600);
     const after = await js('JSON.stringify(window.__dev3d.camera.position)');
     console.log('   orbit off-device:', before === after ? 'NO MOVEMENT (bad)' : 'camera moved OK');
+  }
+  // Sustained orbit drag, for frame-pacing measurement. Traces a small circle
+  // so a long drag stays inside the stage instead of running off the edge.
+  if (s.t === 'orbitn') {
+    const r = JSON.parse(await js(
+      'JSON.stringify(document.getElementById("stage3d").getBoundingClientRect())'));
+    const cx = Math.round(r.left + 40);
+    const cy = Math.round(r.top + r.height * 0.55);
+    const n = s.n || 60;
+    await mouse('mouseMoved', cx, cy, { buttons: 0 });
+    await mouse('mousePressed', cx, cy);
+    for (let i = 1; i <= n; i++) {
+      await mouse('mouseMoved',
+        cx + Math.round(30 * Math.sin(i / 6)),
+        cy + Math.round(18 * Math.cos(i / 6)));
+      await sleep(s.gap === undefined ? 8 : s.gap);
+    }
+    await mouse('mouseReleased', cx, cy);
   }
   if (s.t === 'noorbit') {
     // A drag across the glass must NOT orbit.
