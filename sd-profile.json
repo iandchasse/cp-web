@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "description": "Public demo: three home-screen books, built-in fonts, no dictionary.",
+  "description": "Optional --slim demo: the three books only, no SD fonts or dictionary.",
   "include": [
-    "books/pg1342-images-3.epub",
-    "books/pg1727-images-3.epub",
-    "books/pg1513-images-3.epub"
+    "books/Jane Austen - Pride and Prejudice.epub",
+    "books/Homer - The Odyssey - Rendered into English prose for the use of those who cannot read the original.epub",
+    "books/William Shakespeare - Romeo and Juliet.epub"
   ]
 }

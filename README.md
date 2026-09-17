@@ -18,8 +18,9 @@ See [porting into silkscreen-site](PORTING.md) and the [review findings](REVIEW.
 
 This repo holds **only the build harness** — about 6 MB. The firmware, the
 simulator HAL and the SD card content live elsewhere and are pulled in at build
-time. The default slim output is about 43 MiB; the full-content build is about
-157 MiB.
+time. The build ships the whole SD tree: three books, three SD font families and
+the Oxford dictionary, 61.5 MiB on disk but **20.3 MiB served** after build-time
+compression, of which only 9.2 MiB is fetched before the reader starts.
 
 ## Layout
 
@@ -29,14 +30,14 @@ time. The default slim output is about 43 MiB; the full-content build is about
 | `switcher.html` | The page: model picker, 2D/3D toggle, boot loader, input routing. |
 | `three/` | Vendored three.js, `cp3d.js` (the 3D view), and `x4-device.3mf`. |
 | `shims/` | Host shims the firmware links against, incl. the sleep/wake reload. |
-| `seed.json` | Source first-visit state; the demo build keeps settings, recents and covers. |
-| `sd-profile.json` | Allowlist for the three-book demo; excludes SD fonts and dictionaries. |
+| `seed.json` | Source first-visit state; curated at build time against the shipped library. |
+| `sd-profile.json` | Optional `--slim` allowlist: books only, no SD fonts or dictionary. |
 | `patches/` | Simulator changes not yet upstream (see below). |
 | `pins.env` | Firmware, simulator, Emscripten and ArduinoJson pins. |
 | `package.json`, `package-lock.json` | Pinned browser vendor tooling and libraries. |
 | `runtime/` | Framework-independent framebuffer/filesystem adapters, with TypeScript declarations. |
 | `examples/LivePanel.tsx` | Reuse the live panel in Silkscreen's React Three Fiber scene. |
-| `scripts/` | `bootstrap.ps1` (recreate the env), `pack-fs.ps1` (publish the SD tree). |
+| `scripts/` | `bootstrap.ps1` (recreate the env), `pack-fs.ps1` (publish the SD tree), `capture-seed.mjs` (regenerate `seed.json`). |
 | `serve.py` | Local server, with flags to emulate awkward hosts. |
 | `qa/cdp_3d_input.mjs` | Headless-Chrome QA harness for taps, buttons and orbit. |
 
@@ -49,7 +50,7 @@ time. The default slim output is about 43 MiB; the full-content build is about
   original local workspace was laid out.
 - **`thirdparty/ArduinoJson.h`** — single-header amalgamation, downloaded at
   `ARDUINOJSON_VERSION` and checksum-verified against `ARDUINOJSON_SHA256`.
-- **`fs_/`** (~134 MB) — books, fonts and dictionaries. Published as a release
+- **`fs_/`** (~62 MB) — books, fonts and dictionaries. Published as a release
   asset (`FS_CONTENT_TAG`) because it is large, binary, and changes far less
   often than the code.
 - **`dist/`** — build output. CI serves it straight from the build artifact, so
@@ -69,32 +70,44 @@ Then open <http://127.0.0.1:8000/>.
 Day to day: `python build.py page` for HTML/JS changes (seconds),
 `python build.py model x4pro` for the model only, `all` for everything.
 
-### Slim demo content
+### SD content
 
-The default build includes **three books**, built-in Noto Serif / Noto Sans
-reading fonts, and **no dictionary or SD font packs**. `sd-profile.json` lists
-the books explicitly; a missing entry stops the content build before replacing
-the previous filesystem output. CI uses this profile too.
+The build mirrors the whole of `fs_/` — three books, the Atkinson Hyperlegible
+Next / Bitter / Vollkorn font packs and the Oxford dictionary. Two build-time
+transforms keep that affordable, both undone by the page loader, so what lands
+in MEMFS is byte-for-byte the source file:
+
+- **gzip.** Fonts compress to ~36% and the dictionary to ~22%. No static host
+  applies `Content-Encoding` to these types, so `copy_fs` stores them as `.gz`
+  (marked `"encoding": "gzip"` in the manifest) and the loader inflates them.
+  EPUBs are already zip archives, fail the ratio test, and ship unchanged.
+- **Splitting.** Anything still over 20 MiB is written as `.part-N` files and
+  rejoined by the loader, because Cloudflare Pages rejects assets over 25 MiB.
+
+Dictionaries are marked `defer`, so they stream in after boot rather than
+blocking the first paint: 9.2 MiB is fetched before the reader starts and the
+11 MiB dictionary arrives while you read.
 
 ```sh
 python build.py fs             # update SD content and matching seed only
 python build.py page           # update the page, SD content and matching seed
-python build.py fs --full-fs   # restore the complete source SD tree and seed
+python build.py fs --slim      # books only (sd-profile.json), for a tiny deploy
 ```
 
-`--full-fs` also works with `page`, `model` and `all`. The original `fs_/`,
-release archive and source `seed.json` stay intact. `--skip-fs` preserves an
-existing generated seed so a page-only update cannot restore stale SD settings.
+After changing the library, regenerate the first-visit state so the home screen
+shows the new books rather than an empty shelf. The script drives a running
+build in headless Chrome, opening every book so the firmware writes its own
+recents and cover thumbnails, and keeps the existing `settings.json`:
 
-Measured payload: **134.2 → 24.4 MiB SD content**, **4.55 MB → 22 KB seed**,
-and **157.1 → 43.0 MiB total deployment**. The three book files are unchanged.
-Pride and Prejudice's illustrated EPUB accounts for 23.7 MiB of the remainder.
+```sh
+python serve.py 8098                              # in another shell
+node scripts/capture-seed.mjs http://127.0.0.1:8098/
+```
 
-The generated seed clears the removed font/dictionary selections, retains all
-three recent-book cards and covers, and omits regenerable HTML/image/page caches.
-Books paginate afresh on first open. Existing visitors retain their saved state;
-the firmware falls back to built-in fonts when their selected SD font is missing.
-Dictionary lookup is unavailable in the slim build.
+`--slim` also works with `page`, `model` and `all`. The seed is always curated
+against the library that actually ships: a recent-book card whose EPUB is absent
+is dropped rather than left to open nothing, as are font and dictionary
+selections naming files this build does not include.
 
 ### Browser dependencies and checks
 
@@ -118,7 +131,9 @@ node qa/cdp_smoke.mjs http://127.0.0.1:8099/reader/
 
 The smoke suite checks every enabled device and fails on regressions. Set `CHROME`
 to a Chrome/Chromium executable outside the default Windows installation.
-Repeat against a `--no-coi` server to exercise service-worker isolation.
+Repeat against a `--no-coi` server to exercise service-worker isolation. With
+`CHECK_DEMO_CONTENT=1` it also asserts the shipped library: inflated fonts, the
+rejoined dictionary and a book that paginates.
 
 ## Hosting it
 

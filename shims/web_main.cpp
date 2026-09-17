@@ -56,6 +56,17 @@ EM_JS(void, cpweb_signal_first_frame, (), {
   if (window.cpwebFirstFrame) window.cpwebFirstFrame();
 });
 
+// Flush a frame the render task finished, and announce the very first one so
+// the page can drop its "Waking..." splash. Every path that presents goes
+// through here, including the ones that skip firmware work this frame.
+static void present_and_signal() {
+  static bool firstFrameSignaled = false;
+  if (display.presentIfNeeded() && !firstFrameSignaled) {
+    firstFrameSignaled = true;
+    cpweb_signal_first_frame();
+  }
+}
+
 static void main_tick() {
   if (display.shouldQuit()) {
     emscripten_cancel_main_loop();
@@ -71,7 +82,17 @@ static void main_tick() {
       cpweb_persist_and_reload();
       return;
     }
-    display.presentIfNeeded();
+    present_and_signal();
+    return;
+  }
+
+  // The firmware paces itself with delay() at the end of loop() (10 ms, or
+  // 50 ms once idle). On the main thread that cannot be a sleep -- see delay()
+  // in the simulator's Arduino.h -- so it leaves a deadline here instead. Until
+  // it passes, run no firmware work and let the browser have the thread; still
+  // flush any frame the render task finished, so the panel never lags behind.
+  if (millis() < cpwebDelayDeadline()) {
+    present_and_signal();
     return;
   }
 
@@ -83,11 +104,7 @@ static void main_tick() {
   // The render task set pendingPresent from its worker; flush to the canvas here
   // on the main thread, where SDL/WebGL is valid. On the first frame we actually
   // present, drop the "Waking…" splash the page shows across a sleep/wake reload.
-  static bool firstFrameSignaled = false;
-  if (display.presentIfNeeded() && !firstFrameSignaled) {
-    firstFrameSignaled = true;
-    cpweb_signal_first_frame();
-  }
+  present_and_signal();
 }
 
 int main(int argc, char **argv) {

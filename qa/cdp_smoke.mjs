@@ -71,20 +71,40 @@ try {
     await until(() => js('!!window.fsLoad?.ready'), model + ' filesystem');
     assert.equal(await js('window.fsLoad.error'), null);
     if (process.env.CHECK_DEMO_CONTENT === '1') {
-      assert.deepEqual(await js('Module.FS.readdir("/fs_/books").filter(name => name.endsWith(".epub")).sort()'),
-        ['pg1342-images-3.epub', 'pg1513-images-3.epub', 'pg1727-images-3.epub']);
-      assert.equal(await js('Module.FS.analyzePath("/fs_/fonts").exists'), false);
-      assert.equal(await js('Module.FS.analyzePath("/fs_/dictionaries").exists'), false);
-      const settings = await js('JSON.parse(Module.FS.readFile("/fs_/.crosspoint/settings.json", { encoding: "utf8" }))');
-      assert.equal(settings.sdFontFamilyName || '', '');
-      assert.equal(settings.dictionaryName || '', '');
-      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-      await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-      await until(() => js(`(() => {
-        const path = '/fs_/.crosspoint/epub_1803226487/sections';
-        return Module.FS.analyzePath(path).exists && Module.FS.readdir(path).some(name => name.endsWith('.bin'));
-      })()`), 'book layout regenerated with built-in font');
-      console.log(`${model}: three-book profile, built-in font and first-book pagination passed`);
+      // The full SD tree ships: three books, three SD font families and the
+      // dictionary. Fonts and the dictionary are served gzipped and the
+      // dictionary in parts, so this also proves the loader rebuilt them byte
+      // for byte -- a wrong inflate or a dropped part would show up here.
+      assert.deepEqual(await js('Module.FS.readdir("/fs_/books").filter(name => name.endsWith(".epub")).length'), 3);
+      assert.deepEqual(await js('Module.FS.readdir("/fs_/fonts").filter(name => !name.startsWith(".")).sort()'),
+        ['AtkinsonHyperlegibleNext', 'Bitter', 'Vollkorn']);
+      const font = await js('Module.FS.stat("/fs_/fonts/Bitter/Bitter_16.cpfont").size');
+      assert.ok(font > 700000, `inflated font too small: ${font}`);
+      const dictionary = await js(`(() => {
+        const dir = '/fs_/dictionaries/Oxford English';
+        const name = Module.FS.readdir(dir).find(f => f.endsWith('.dict'));
+        return name ? Module.FS.stat(dir + '/' + name).size : 0;
+      })()`);
+      assert.ok(dictionary > 40 * 1024 * 1024, `split dictionary not rejoined: ${dictionary}`);
+      // Nothing may arrive as a .gz or .part-N: those are transport artifacts.
+      assert.deepEqual(await js(`Module.FS.readdir('/fs_/fonts/Bitter').filter(f => /\.(gz|part-\d+)$/.test(f))`), []);
+      // Home -> File Browser -> books -> first book. The seeded recents list is
+      // empty (its covers named the previous library), so the home screen opens
+      // on the menu; walk in with Enter until a book actually paginates.
+      const paginated = () => js(`(() => {
+        const root = '/fs_/.crosspoint';
+        return Module.FS.readdir(root).filter(f => f.startsWith('epub_')).some(book => {
+          const path = root + '/' + book + '/sections';
+          return Module.FS.analyzePath(path).exists && Module.FS.readdir(path).some(name => name.endsWith('.bin'));
+        });
+      })()`);
+      for (let press = 0; press < 4 && !(await paginated()); press++) {
+        await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+        await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+        await sleep(1500);
+      }
+      await until(paginated, 'book layout regenerated');
+      console.log(`${model}: full SD tree, inflated fonts, rejoined dictionary and pagination passed`);
     }
     // Toggle on then off while the model is still loading.
     await js('window.__enable3d(); document.getElementById("view3d").click()');

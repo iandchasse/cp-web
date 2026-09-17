@@ -17,8 +17,8 @@ Usage (after dot-sourcing emsdk_env.ps1 so emcc is on PATH):
   python build.py clean         # remove objects + dist
 
 Flags:
-  --skip-fs   don't mirror fs_ (CI builds the 134 MB SD tree separately)
-  --full-fs   include the original SD tree and seed instead of sd-profile.json
+  --skip-fs   don't mirror fs_ (CI builds the SD tree separately)
+  --slim      ship only sd-profile.json's allowlist instead of the whole tree
 """
 import os
 import re
@@ -27,6 +27,9 @@ import sys
 import concurrent.futures
 import shutil
 import functools
+import gzip
+import io
+import itertools
 from urllib.parse import quote
 from sd_content import select_files, curate_seed
 
@@ -49,10 +52,36 @@ OBJ = os.path.join(ROOT, "obj")
 DIST = os.path.join(ROOT, "dist")
 FSROOT = os.path.join(ROOT, "fs_")
 
+# Cloudflare Pages rejects a single asset over 25 MiB; anything larger is served
+# as numbered .part-N files and rejoined by the page loader.
+PART_SIZE = 20 * 1024 * 1024
+
+def firmware_version():
+    """The firmware's own version, as `git describe` reports it in firmware/.
+
+    Shown on the boot and Settings screens. A pinned checkout is detached at a
+    SHA, so describe resolves it against the nearest upstream tag, e.g.
+    "1.6.0rc-56-g84fcff8". Falls back to the pinned ref when git is unavailable
+    (a source export rather than a clone), never to a made-up number.
+    """
+    try:
+        described = subprocess.run(
+            ["git", "-C", FW, "describe", "--tags", "--always", "--dirty"],
+            capture_output=True, text=True)
+        if described.returncode == 0 and described.stdout.strip():
+            return described.stdout.strip() + "-web"
+    except OSError:
+        pass
+    for line in open(os.path.join(ROOT, "pins.env"), encoding="utf-8"):
+        if line.startswith("FIRMWARE_REF="):
+            return line.split("=", 1)[1].strip()[:8] + "-web"
+    return "unknown-web"
+
+
 DEFINES = [
     "SIMULATOR",
     "CROSSPOINT_SIMULATOR_PROJECT_WEBSERVER",
-    'CROSSPOINT_VERSION="dev-web"',
+    f'CROSSPOINT_VERSION="{firmware_version()}"',
     "ENABLE_SERIAL_LOG",
     "LOG_LEVEL=2",
     "EINK_DISPLAY_SINGLE_BUFFER_MODE=1",
@@ -410,7 +439,7 @@ def _iter_fs_files():
             yield full, rel
 
 
-def copy_fs(full_fs=False):
+def copy_fs(slim=False):
     """Mirror the fs_ tree into dist/fs as loose static files and emit
     manifest.json. The page loader fetches these into MEMFS at boot instead of a
     baked .data package (25 MiB Cloudflare Pages asset cap).
@@ -431,11 +460,13 @@ def copy_fs(full_fs=False):
         return 1
     candidates = list(_iter_fs_files())
     try:
-        selected = candidates if full_fs else select_files(candidates, os.path.join(ROOT, "sd-profile.json"))
+        selected = candidates if not slim else select_files(candidates, os.path.join(ROOT, "sd-profile.json"))
         with open(os.path.join(ROOT, "seed.json"), encoding="utf-8") as stream:
             seed = json.load(stream)
-        if not full_fs:
-            seed = curate_seed(seed, [rel for _, rel in selected])
+        # Always curate: the seed's recents, covers and font/dictionary choices
+        # name specific files, and a seeded recent whose book is not in this
+        # build is a home-screen card that opens nothing.
+        seed = curate_seed(seed, [rel for _, rel in selected])
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"[fs] ERROR: {error}; existing output preserved")
         return 1
@@ -446,19 +477,57 @@ def copy_fs(full_fs=False):
         if os.path.normcase(os.path.realpath(fsout)) != os.path.normcase(os.path.abspath(fsout)):
             raise ValueError(f"Refusing to replace redirected output: {fsout}")
         shutil.rmtree(fsout)
-    files, total, deferred = [], 0, 0
+    files, total, deferred, split = [], 0, 0, 0
     for full, rel in selected:
         dst = os.path.join(fsout, rel.replace("/", os.sep))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(full, dst)
         size = os.path.getsize(full)
         # Dictionaries are large and discovered lazily (only when Settings is
         # opened), so stream them after boot instead of blocking the first paint.
         defer = rel.startswith("dictionaries/")
         total += size
         deferred += size if defer else 0
-        files.append({"path": "/fs_/" + rel, "url": "fs/" + quote(rel, safe="/"),
-                      "size": size, "defer": defer})
+        entry = {"path": "/fs_/" + rel, "size": size, "defer": defer}
+        # Neither GitHub Pages nor Cloudflare compresses these content types, so
+        # compress them here and let the loader inflate. Fonts land at ~36% and
+        # the dictionary at ~22%; EPUBs are already zip archives, so they fail
+        # the ratio test and ship as they are.
+        body = None
+        with open(full, "rb") as source:
+            raw = source.read()
+        packed = gzip.compress(raw, 6, mtime=0)
+        if len(packed) < size * 0.9:
+            body, entry["encoding"] = packed, "gzip"
+            rel = rel + ".gz"
+            dst = dst + ".gz"
+        stored = len(body) if body is not None else size
+        if stored > PART_SIZE:
+            # Cloudflare Pages rejects any single asset over 25 MiB, and a
+            # dictionary alone is well past that. Serve it as numbered parts;
+            # the loader concatenates them back into one MEMFS file and checks
+            # the total against "size", so a truncated part cannot slip through.
+            parts = []
+            stream = io.BytesIO(body) if body is not None else open(full, "rb")
+            try:
+                for index in itertools.count():
+                    chunk = stream.read(PART_SIZE)
+                    if not chunk:
+                        break
+                    with open(f"{dst}.part-{index}", "wb") as out:
+                        out.write(chunk)
+                    parts.append(f"{quote(rel, safe='/')}.part-{index}")
+            finally:
+                stream.close()
+            entry["parts"] = ["fs/" + part for part in parts]
+            split += 1
+        elif body is not None:
+            with open(dst, "wb") as out:
+                out.write(body)
+            entry["url"] = "fs/" + quote(rel, safe="/")
+        else:
+            shutil.copy2(full, dst)
+            entry["url"] = "fs/" + quote(rel, safe="/")
+        files.append(entry)
     files.sort(key=lambda e: e["path"])
     with open(os.path.join(DIST, "manifest.json"), "w") as f:
         json.dump({"version": 1, "files": files}, f, indent=2)
@@ -466,13 +535,18 @@ def copy_fs(full_fs=False):
         json.dump(seed, f, separators=(",", ":"))
     selected_paths = {rel for _, rel in selected}
     omitted = sum(os.path.getsize(path) for path, rel in candidates if rel not in selected_paths)
+    served = sum(os.path.getsize(os.path.join(dp, f))
+                 for dp, _, names in os.walk(fsout) for f in names)
     print(f"[fs] {len(files)} loose files -> dist/fs "
-          f"({total/1048576:.1f} MB total, {deferred/1048576:.1f} MB deferred)")
-    print(f"[fs] {'full' if full_fs else 'demo'} profile: omitted {omitted/1048576:.1f} MB; source fs_/ unchanged")
+          f"({total/1048576:.1f} MB total, {deferred/1048576:.1f} MB deferred, "
+          f"{served/1048576:.1f} MB served after compression)")
+    print(f"[fs] {'demo' if slim else 'full'} profile: omitted {omitted/1048576:.1f} MB; source fs_/ unchanged")
+    if split:
+        print(f"[fs] {split} oversized file(s) served in {PART_SIZE/1048576:.0f} MB parts")
     return 0
 
 
-def copy_page(built=None, skip_fs=False, full_fs=False):
+def copy_page(built=None, skip_fs=False, slim=False):
     """Copy the switcher HTML + COI service worker into dist/, and write
     models.json describing which model bundles are available."""
     import json
@@ -531,7 +605,7 @@ def copy_page(built=None, skip_fs=False, full_fs=False):
     with open(os.path.join(DIST, "models.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"[page] index.html + models.json ({', '.join(built) or 'none'})")
-    # CI builds the code and the SD tree separately: the tree is ~134 MB and
+    # CI builds the code and the SD tree separately: the tree is ~62 MB and
     # changes far less often than the wasm, so re-mirroring it every run just
     # buys a slow artifact upload. Guard against a *silent* empty library --
     # if fs_ is genuinely missing, say so rather than emitting a manifest with
@@ -546,7 +620,7 @@ def copy_page(built=None, skip_fs=False, full_fs=False):
     if not os.path.isdir(FSROOT):
         print(f"[page] ERROR: {FSROOT} missing and --skip-fs not given")
         return 1
-    return copy_fs(full_fs=full_fs)
+    return copy_fs(slim=slim)
 
 
 def cmd_clean():
@@ -561,14 +635,14 @@ if __name__ == "__main__":
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     skip_fs = "--skip-fs" in flags
-    full_fs = "--full-fs" in flags
+    slim = "--slim" in flags
     cmd = argv[0] if argv else "all"
     if cmd == "clean":
         sys.exit(cmd_clean())
     elif cmd == "page":
-        sys.exit(copy_page(skip_fs=skip_fs, full_fs=full_fs))
+        sys.exit(copy_page(skip_fs=skip_fs, slim=slim))
     elif cmd == "fs":
-        sys.exit(copy_fs(full_fs=full_fs))
+        sys.exit(copy_fs(slim=slim))
     elif cmd == "model":
         if len(argv) < 2 or argv[1] not in ENABLED_MODELS:
             print("usage: build.py model <" + " | ".join(ENABLED_MODELS) + ">")
@@ -578,7 +652,7 @@ if __name__ == "__main__":
         mid = argv[1]
         rc = build_model(mid)
         if rc == 0:
-            rc = copy_page(skip_fs=skip_fs, full_fs=full_fs)
+            rc = copy_page(skip_fs=skip_fs, slim=slim)
         sys.exit(rc)
     elif cmd == "all":
         built = []
@@ -587,7 +661,7 @@ if __name__ == "__main__":
                 built.append(mid)
             else:
                 print(f"[all] {mid} FAILED")
-        page_rc = copy_page(built, skip_fs=skip_fs, full_fs=full_fs)
+        page_rc = copy_page(built, skip_fs=skip_fs, slim=slim)
         sys.exit(0 if len(built) == len(ENABLED_MODELS) and page_rc == 0 else 1)
     else:
         print(__doc__)

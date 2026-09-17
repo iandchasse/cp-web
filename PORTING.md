@@ -80,13 +80,14 @@ page's HTML. Copy the entire generated reader directory, including `runtime/`,
 
 ## Performance work to prioritize next
 
-- The default three-book profile is now 24.4 MiB, down from the source archive's
-  134.2 MiB (previously 88 MiB eager and 46 MiB deferred). No SD fonts or dictionaries
-  ship; the source tree remains available with `--full-fs`. The generated seed is
-  about 22 KB instead of 4.55 MB. Most remaining content is the illustrated Pride
-  and Prejudice EPUB. Silkscreen's "a few MB" copy still understates the download.
-  True book-on-demand loading needs coordination with synchronous
-  firmware file access; replacing `fetch` alone is insufficient.
+- The published library is the whole SD tree (three books, three SD font packs,
+  the Oxford dictionary): 61.5 MiB of files served as 20.3 MiB after build-time
+  gzip, of which 9.2 MiB is fetched before the reader starts and the 11 MiB
+  dictionary streams afterwards. First boot on a 20 Mbit link measures about
+  7.7 s, against 33 s for the earlier 24 MiB illustrated-EPUB library. The
+  generated seed is about 2 KB instead of 4.55 MB. Silkscreen's "a few MB" copy
+  still understates the download. True book-on-demand loading needs coordination
+  with synchronous firmware file access; replacing `fetch` alone is insufficient.
 - The framebuffer copy skips unchanged frames and reuses its JS buffer. The
   standalone demo still renders to SDL and mirrors into a second WebGL context.
   Use `LivePanel` with the existing R3F renderer to avoid adding a third context.

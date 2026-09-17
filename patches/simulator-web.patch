@@ -1,3 +1,50 @@
+diff --git a/src/Arduino.h b/src/Arduino.h
+index eadbe24..de0fc07 100644
+--- a/src/Arduino.h
++++ b/src/Arduino.h
+@@ -9,6 +9,9 @@
+ #include <cstdlib>
+ #include <string>
+ #include <thread>
++#ifdef __EMSCRIPTEN__
++#include <emscripten/threading.h>
++#endif
+ 
+ #define PROGMEM
+ #define ICACHE_RODATA_ATTR
+@@ -30,7 +33,32 @@ inline unsigned long micros() {
+   return duration_cast<microseconds>(steady_clock::now() - start).count();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// How long the firmware has asked the main thread to pause for, as an absolute
++// millis() deadline. Read by the web main loop (shims/web_main.cpp), which
++// simply runs no firmware work until it passes.
++inline unsigned long &cpwebDelayDeadline() {
++  static unsigned long deadline = 0;
++  return deadline;
++}
++#endif
++
+ inline void delay(unsigned long ms) {
++#ifdef __EMSCRIPTEN__
++  // A browser main thread cannot sleep: Emscripten spins instead, and that
++  // thread is the only one that can service requestAnimationFrame, input and
++  // WebGL. loop() ends with delay(10), or delay(50) once idle, so honouring it
++  // literally burned 10-50 ms of every animation frame -- visible as a capped
++  // frame rate while orbiting the 3D view. Record the deadline and return; the
++  // frame loop skips firmware work until it expires, which keeps the firmware's
++  // own pacing without blocking the page. Worker threads still really sleep.
++  if (emscripten_is_main_browser_thread()) {
++    unsigned long &deadline = cpwebDelayDeadline();
++    const unsigned long until = millis() + ms;
++    if (until > deadline) deadline = until;
++    return;
++  }
++#endif
+   std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+ }
+ inline void yield() { std::this_thread::yield(); }
 diff --git a/src/HalDisplay.cpp b/src/HalDisplay.cpp
 index 2a4a2da..a66a8cb 100644
 --- a/src/HalDisplay.cpp

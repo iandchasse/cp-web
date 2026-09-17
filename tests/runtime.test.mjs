@@ -107,3 +107,69 @@ test('filesystem cannot escape its SD root or overwrite persisted settings', asy
     assert.equal(writes.size, 0);
   }
 });
+
+test('prefetch downloads in parallel before an FS exists and writes in manifest order', async () => {
+  const files = Array.from({ length: 6 }, (_, i) => ({ path: `/fs_/b${i}`, url: `fs/b${i}`, size: 2 }));
+  const writes = [];
+  let inFlight = 0, peak = 0, fs = null;
+  const release = [];
+  const loader = createFilesystemLoader({
+    baseUrl: 'https://example.test/',
+    // An FS only appears once the runtime instantiates; prefetch must not need it.
+    getFS: () => fs ?? (() => { throw new Error('runtime not ready'); })(),
+    concurrency: 3,
+    fetchImpl: async url => {
+      if (String(url).endsWith('manifest.json')) return Response.json({ version: 1, files });
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise(resolve => release.push(resolve));
+      inFlight--;
+      return new Response(Uint8Array.of(1, 2));
+    },
+  });
+  loader.prefetch();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(peak, 3, 'should saturate the concurrency window without an FS');
+  fs = { mkdirTree() {}, writeFile(path) { writes.push(path); } };
+  // Finish the downloads out of manifest order; writes must still be in order.
+  const eager = loader.loadEager();
+  while (release.length) release.pop()();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  while (release.length) release.pop()();
+  await eager;
+  assert.deepEqual(writes, files.map(file => file.path));
+  assert.equal(loader.state.eagerPct, 100);
+});
+
+test('a prefetch failure surfaces from loadEager, not as an unhandled rejection', async () => {
+  const rejections = [];
+  process.on('unhandledRejection', error => rejections.push(error));
+  const { loader } = fixture([{ path: '/fs_/book', url: 'fs/book', size: 2 }],
+    () => new Response('', { status: 503 }));
+  loader.prefetch();
+  await assert.rejects(loader.loadEager(), /HTTP 503/);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(rejections, []);
+});
+
+test('compressed assets are inflated and checked against their real size', async () => {
+  const raw = new TextEncoder().encode('font'.repeat(64));
+  const gz = new Uint8Array(await new Response(
+    new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+  const half = gz.subarray(0, Math.ceil(gz.length / 2));
+  const rest = gz.subarray(half.length);
+
+  const { loader, writes } = fixture(
+    [{ path: '/fs_/a.cpfont', url: 'fs/a.gz', size: raw.length, encoding: 'gzip' },
+     { path: '/fs_/b.cpfont', parts: ['fs/b0', 'fs/b1'], size: raw.length, encoding: 'gzip' }],
+    (() => { const bodies = [gz, half, rest]; return () => new Response(bodies.shift()); })());
+  await loader.loadEager();
+  assert.deepEqual([...writes.get('/fs_/a.cpfont')], [...raw], 'single-file asset');
+  assert.deepEqual([...writes.get('/fs_/b.cpfont')], [...raw], 'parts joined before inflating');
+
+  const wrongSize = fixture([{ path: '/fs_/c', url: 'fs/c.gz', size: raw.length + 1, encoding: 'gzip' }],
+    () => new Response(gz));
+  await assert.rejects(wrongSize.loader.loadEager(), /size mismatch/);
+
+  const unknown = fixture([{ path: '/fs_/d', url: 'fs/d', size: 4, encoding: 'brotli' }]);
+  await assert.rejects(unknown.loader.loadEager(), /Unsupported encoding/);
+});

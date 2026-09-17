@@ -250,6 +250,15 @@
       onProgress: pct => window.Module.setStatus('Loading filesystem… ' + pct + '%'),
     });
     window.fsLoad = filesystem.state;
+    // Start the SD download now, not in preRun: the WASM still has to arrive
+    // and compile, and the eager set is far larger than the runtime. Waiting
+    // for the runtime before opening a single connection left the link idle
+    // for the whole of that download on a first visit.
+    // Only when the firmware can actually run here: without isolation the page
+    // shows the new-tab notice instead of booting, and a download nothing will
+    // consume is pure waste (the reload after the COI service worker installs
+    // reaches this line too).
+    if (window.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined') filesystem.prefetch();
     const fsLoadEager = () => filesystem.loadEager();
     const fsLoadDeferred = () => filesystem.loadDeferred().catch(error => console.error('[fs]', error));
 

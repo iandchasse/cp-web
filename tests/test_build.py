@@ -2,6 +2,7 @@ import importlib.util
 import pathlib
 import tempfile
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ spec.loader.exec_module(build)
 
 class BuildTests(unittest.TestCase):
     def test_bad_profile_preserves_filesystem_and_seed(self):
+        # --slim validates every allowlist rule before replacing the output.
         with tempfile.TemporaryDirectory() as folder:
             root = pathlib.Path(folder)
             source = root / 'source'
@@ -22,7 +24,7 @@ class BuildTests(unittest.TestCase):
             old.write_text('old book')
             (root / 'seed.json').write_text('old seed')
             with patch.object(build, 'FSROOT', str(source)), patch.object(build, 'DIST', folder):
-                self.assertEqual(build.copy_fs(), 1)
+                self.assertEqual(build.copy_fs(slim=True), 1)
             self.assertEqual(old.read_text(), 'old book')
             self.assertEqual((root / 'seed.json').read_text(), 'old seed')
 
@@ -34,10 +36,31 @@ class BuildTests(unittest.TestCase):
             (source / 'book #1%.epub').write_bytes(b'book')
             output = root / 'output'
             with patch.object(build, 'FSROOT', str(source)), patch.object(build, 'DIST', str(output)):
-                self.assertEqual(build.copy_fs(full_fs=True), 0)
+                self.assertEqual(build.copy_fs(), 0)
             entry = json.loads((output / 'manifest.json').read_text())['files'][0]
             self.assertEqual(entry['url'], 'fs/book%20%231%25.epub')
             self.assertEqual(entry['path'], '/fs_/book #1%.epub')
+
+    def test_oversized_assets_are_split_into_fetchable_parts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = pathlib.Path(folder)
+            source = root / 'source'
+            (source / 'dictionaries').mkdir(parents=True)
+            big = source / 'dictionaries' / 'big.dict'
+            # Incompressible, so it is stored as-is and must be split. (A
+            # compressible file of the same size fits in one part once gzipped.)
+            big.write_bytes(os.urandom(build.PART_SIZE + 5))
+            output = root / 'output'
+            with patch.object(build, 'FSROOT', str(source)), patch.object(build, 'DIST', str(output)):
+                self.assertEqual(build.copy_fs(), 0)
+            entry = json.loads((output / 'manifest.json').read_text())['files'][0]
+            self.assertEqual(entry['parts'], ['fs/dictionaries/big.dict.part-0', 'fs/dictionaries/big.dict.part-1'])
+            self.assertNotIn('url', entry)
+            self.assertEqual(entry['size'], build.PART_SIZE + 5)
+            parts = sorted((output / 'fs' / 'dictionaries').glob('big.dict.part-*'))
+            self.assertEqual(b''.join(part.read_bytes() for part in parts), big.read_bytes())
+            # The whole file must not also ship, or the deploy pays for it twice.
+            self.assertFalse((output / 'fs' / 'dictionaries' / 'big.dict').exists())
 
     def test_compiler_upgrade_invalidates_object_signature(self):
         with patch.object(build, 'compiler_identity', return_value='old compiler'):

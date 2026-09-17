@@ -1,12 +1,8 @@
 # Review and dependency update — 2026-09-16
 
-**Content follow-up:** default builds now apply `sd-profile.json`: three novels,
-no SD font packs or dictionary, and a settings/recents/covers-only seed. SD content
-is 24.4 MiB, seed is 22 KB, and total output is 43.0 MiB. The larger measurements
-below describe the original/full-content baseline. See README for `--full-fs`.
-The slim profile passed all three device browser checks, including first-book
-pagination with built-in fonts and regenerated caches. All three EPUBs were
-verified byte-for-byte against the source tree.
+**Performance follow-up, 2026-09-17** — see "Startup and frame rate" below.
+Builds now ship the entire SD tree (`--slim` restores the books-only profile),
+compressed and split at build time, and only the X4 Pro bundle is built.
 
 ## Dependencies
 
@@ -73,11 +69,13 @@ Release references: [Three.js r186](https://github.com/mrdoob/three.js/releases/
    iframe does not make the parent cross-origin isolated. A child service worker
    cannot solve this. Use a separate top-level reader route, or isolate the parent
    and configure the embed appropriately. See `PORTING.md`.
-2. **Startup payload is large.** The published SD tree has 96 files, about 134.2
-   MiB total, with 88 MiB eager and 46.2 MiB deferred. The 4.55 MB seed is additional.
-   Caching helps repeat visits but not first boot. Curating a demo library offers a
-   larger gain than micro-optimizing the nine-call 3D scene. A single-part fetch no
-   longer creates an unnecessary second full-file JS buffer.
+2. **Startup payload is bounded by the library, not the code.** 9.2 MiB of
+   compressed fonts and books plus 3.1 MiB of gzipped WASM are fetched before
+   the first frame; the 11 MiB dictionary streams afterwards. Caching helps
+   repeat visits but not first boot. Deferring the two unselected font families
+   would take another 3 MiB off the critical path, at the cost of them missing
+   from Settings until the next reload, because font discovery runs once at boot.
+
 3. **The firmware runtime is not yet a React component.** Global Module, SDL input,
    worker lifetime, IDBFS state and reload-based wake still belong to the document.
    This pass extracts reusable data adapters and a renderer lifecycle; it does not
@@ -92,6 +90,41 @@ Release references: [Three.js r186](https://github.com/mrdoob/three.js/releases/
 6. **Legacy QA scripts are exploratory.** Several old gesture checks print a
    warning rather than assert it. The added `qa/cdp_smoke.mjs` fails on its checked
    regressions and cleans up its browser; it does not replace all gesture coverage.
+
+## Startup and frame rate — 2026-09-17
+
+Measured with a fresh Chrome profile against the deployed site, CDP-throttled to
+20 Mbit/s, and repeated locally after each change.
+
+| | Before | After |
+| --- | --- | --- |
+| First visit to first frame (20 Mbit) | 33.3 s | 7.7 s |
+| Bytes before the first frame | 27.4 MiB | 12.3 MiB |
+| 3D view, idle or orbiting | 20 fps | 60 fps |
+
+- **The library blocked the boot, not the runtime.** The firmware itself reached
+  its home screen 0.2 s after instantiating; 32 of the 33 s was one 24 MiB
+  illustrated EPUB, which `main()` waits for. The new SD tree, its EPUBs already
+  optimized upstream, plus build-time gzip of fonts and dictionaries, is what
+  moved this. Relinking with `-Os`/`-O3` or without assertions was measured and
+  rejected: under 1% of the gzipped WASM.
+- **The SD download no longer waits for the runtime.** `prefetch()` starts the
+  manifest and eager assets as the page parses, four at a time, and `loadEager`
+  writes the bytes already in flight in manifest order. Previously nothing was
+  requested until the runtime called `preRun`, leaving the link idle through the
+  whole WASM download and compile.
+- **The seed had to be recaptured.** Its recents and covers named the previous
+  library's filenames, so the home screen opened on an empty shelf. The build
+  already drops recents whose books are absent; `scripts/capture-seed.mjs` now
+  regenerates them by driving a real build, one book per clean session.
+- **`delay()` on the browser main thread was a busy-wait.** The firmware's
+  `loop()` ends with `delay(10)`, or `delay(50)` after three idle seconds, and
+  Emscripten cannot sleep the main thread, so it spun there — flooring every
+  animation frame at 50 ms whenever the user was not pressing anything, which is
+  exactly what orbiting the 3D view is. The web build now records the requested
+  deadline (`cpwebDelayDeadline`) and the frame loop runs no firmware work until
+  it passes, keeping the firmware's own pacing without holding the thread.
+  Frames the render task finished are still flushed on those skipped frames.
 
 ## Validation
 
