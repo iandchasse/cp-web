@@ -115,6 +115,26 @@ try {
     const dimensions = await js('[window.__dev3d.tex.image.width, window.__dev3d.tex.image.height]');
     assert.deepEqual(dimensions, model === 'x3' ? [528, 792] : [480, 800]);
     assert.ok(await js('window.__dev3d.tris > 0'));
+    // The panel is lit e-paper, dark until the firmware's own frontlight comes
+    // on: open the quick panel with a status-bar tap in 2D, toggle it with
+    // Enter, and the 3D material must follow the exported state.
+    assert.equal(await js('window.__dev3d.screen.material.emissiveIntensity'), 0, 'frontlight off at boot');
+    await js('document.getElementById("view3d").click()');
+    await sleep(800);
+    const bar = await js('(() => { const r = document.getElementById("canvas").getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + 12 }; })()');
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...bar, button: 'left', buttons: 1, clickCount: 1 });
+    await sleep(80);
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...bar, button: 'left', buttons: 0, clickCount: 1 });
+    await sleep(2000);
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await until(() => js('Module._cp_frontlight_on() === 1'), 'firmware frontlight on', 10000);
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await sleep(500);
+    await js('document.getElementById("view3d").click()');
+    await until(() => js('window.__dev3d.screen.material.emissiveIntensity > 0'), 'panel emissive follows the frontlight', 10000);
+    assert.equal(await js('window.__dev3d.halo.visible'), true);
     // Drive a real physical-button press through the capture listeners.
     const button = await js('window.__dev3d.buttonToClient("down")');
     await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...button, button: 'left', buttons: 1, clickCount: 1 });

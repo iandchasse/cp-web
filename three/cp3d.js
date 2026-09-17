@@ -20,7 +20,9 @@
 import * as THREE from './three.module.min.js';
 import { ThreeMFLoader } from './3MFLoader.js';
 import { OrbitControls } from './OrbitControls.js';
+import { RoomEnvironment } from './RoomEnvironment.js';
 import { FramebufferReader } from '../runtime/framebuffer.js';
+import { readFrontlight, frontlightEmissive, einkLut, applyLut } from '../runtime/frontlight.js';
 
 const MODEL_URL = new URL('./x4-device.3mf', import.meta.url);
 
@@ -71,6 +73,14 @@ const DEFAULTS = {
   panelW: 59.10,  // visible panel width
   topGap: null,   // null = match the side gap
   zLift: 0.05,    // how far the panel floats above the face plane
+  // The panel is lit like a real e-paper display, not shown as a light source:
+  // ink and paper are diffuse surfaces under the scene's lights, and only the
+  // firmware's frontlight adds glow. These are the reflectances (sRGB) the
+  // framebuffer's pure white and black map to, and how strong 100% light is.
+  einkWhite: 222,
+  einkBlack: 52,
+  glow: 2.2,      // emissive at 100%: well past paper white, so a lit panel reads as lit
+  shadows: true,
 };
 
 export class Device3D {
@@ -82,6 +92,11 @@ export class Device3D {
       opts.getModule || (() => window.Module),
       opts.isReady || (() => !!window.__cpFirstFrame),
     );
+    // Frontlight state comes from the firmware too. Injectable for hosts that
+    // do not use window.Module, like the framebuffer above.
+    this.getFrontlight = opts.getFrontlight || (() => readFrontlight(window.Module));
+    this.lut = einkLut(this.opts.einkWhite, this.opts.einkBlack);
+    this.frontlight = { on: false, brightness: 0, warmth: 0 };
     this._abort = new AbortController();
     this._disposed = false;
     // Physical panel size. The framebuffer is always the landscape panel; the
@@ -101,6 +116,14 @@ export class Device3D {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.setSize(w, h, false);
+    // Filmic tone mapping so a lit frontlight can go brighter than paper white
+    // without clipping to a flat block, and soft shadows for the ground contact.
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.0;
+    if (this.opts.shadows) {
+      this.renderer.shadowMap.enabled = true;
+      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    }
     // Out of flow on purpose: the host's height comes from flex, and the canvas
     // is sized from the host, so leaving it in flow would be circular.
     this.renderer.domElement.style.cssText =
@@ -110,18 +133,30 @@ export class Device3D {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(30, w / h, 1, 4000);
 
-    // Three-point-ish lighting. The model ships one flat light-blue colour and
-    // no normals, so shading is entirely down to computeVertexNormals + these.
-    this.scene.add(new THREE.HemisphereLight(0xbfd4e8, 0x20242b, 1.5));
-    const key = new THREE.DirectionalLight(0xffffff, 2.2);
-    key.position.set(-120, 180, 260);
+    // Image-based lighting from a neutral studio room gives the case its soft
+    // reflections and the panel an even ambient, the way a device on a desk is
+    // lit by the room rather than by three spotlights. One key light on top of
+    // that provides direction and the shadow.
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.envMap = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    pmrem.dispose();
+    this.scene.environment = this.envMap;
+    this.scene.environmentIntensity = 0.75;
+
+    const key = new THREE.DirectionalLight(0xfff4e8, 1.6);
+    key.position.set(-120, 220, 240);
+    if (this.opts.shadows) {
+      key.castShadow = true;
+      key.shadow.mapSize.set(2048, 2048);
+      key.shadow.bias = -0.0004;
+      key.shadow.normalBias = 0.4;   // model units are millimetres
+      key.shadow.radius = 4;
+    }
     this.scene.add(key);
-    const fill = new THREE.DirectionalLight(0xaec4dd, 0.8);
-    fill.position.set(220, -60, 140);
+    this.keyLight = key;
+    const fill = new THREE.DirectionalLight(0xdce6f5, 0.35);
+    fill.position.set(220, -40, 140);
     this.scene.add(fill);
-    const rim = new THREE.DirectionalLight(0xffffff, 1.1);
-    rim.position.set(60, 120, -260);
-    this.scene.add(rim);
 
     this.root = new THREE.Group();
     this.scene.add(this.root);
@@ -189,7 +224,8 @@ export class Device3D {
     // Glass-shaped, not buffer-shaped: the texture is always the portrait
     // panel as mounted (fbH x fbW). _blit does the fixed physical rotation.
     this.texBuf = new Uint8Array(this.fbW * this.fbH * 4);
-    this.texBuf.fill(0xff); // start white, like a cleared panel
+    this.texBuf.fill(0xff); // start white, like a cleared panel...
+    applyLut(this.texBuf, this.lut); // ...which on e-paper is light grey
     this.tex = new THREE.DataTexture(this.texBuf, this.fbH, this.fbW, THREE.RGBAFormat);
     // Nearest keeps the Bayer dithering crisp instead of smearing it to mush.
     this.tex.magFilter = THREE.NearestFilter;
@@ -222,24 +258,22 @@ export class Device3D {
       // No normals in the file; without these the mesh renders unlit-flat.
       if (!g.attributes.normal) g.computeVertexNormals();
       tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
-      // Replace the model's flat #9DCFED with something that reads as a device.
-      //
-      // Phong rather than Standard: the scene is fill-bound (one mesh covering
-      // most of the viewport, only 9 draw calls), so the body's fragment shader
-      // is the dominant cost. Measured at 1.5x faster overall than the PBR
-      // material -- and with a single flat colour, no maps and computed
-      // normals, there is nothing for PBR to express: a pixel diff of the two
-      // renders came out 90.7% identical, with 0.008% of pixels differing by
-      // more than 24/255 (confined to specular highlight edges).
+      // Replace the model's flat #9DCFED with a matte dark plastic. Standard
+      // (PBR) rather than the Phong an earlier version chose for fill-rate on
+      // the SwiftShader QA box: with an environment map the difference is the
+      // whole point -- soft room reflections are what make the case read as a
+      // real object -- and rendering is on demand, so the cost is per change,
+      // not per frame.
       const materials = Array.isArray(n.material) ? n.material : [n.material];
       for (const material of materials) {
         for (const value of Object.values(material)) if (value?.isTexture) value.dispose();
         material.dispose();
       }
-      n.material = new THREE.MeshPhongMaterial({
-        color: 0x3c4149, shininess: 25, specular: 0x2a2f36,
+      n.material = new THREE.MeshStandardMaterial({
+        color: 0x363b43, roughness: 0.55, metalness: 0.05, envMapIntensity: 1.0,
         vertexColors: false,
       });
+      n.castShadow = n.receiveShadow = !!this.opts.shadows;
     });
     this.tris = Math.round(tris);
 
@@ -249,6 +283,8 @@ export class Device3D {
     obj.position.sub(ctr);            // centre the model on the origin
     this.root.add(obj);
     this.size = size;
+
+    if (this.opts.shadows) this._addGround(size);
 
     this._addScreen(box, ctr, size);
     this._frameCamera(size);
@@ -278,19 +314,108 @@ export class Device3D {
     // No synthetic bezel: the panel is the bezel. It sits a hair proud of the
     // face plane, still well behind the 3.70 lip across the chin, so it reads as
     // set into the case rather than stuck on it.
+    //
+    // E-paper is a reflective display: the ink is a diffuse surface that the
+    // room lights, not a backlit LCD. So the panel is a lit, fully rough
+    // material whose map is the framebuffer already remapped to e-paper
+    // reflectances (see einkLut). The firmware's frontlight is the only thing
+    // that makes it emit: the same texture as an emissive map, tinted and
+    // scaled by the light's warmth and brightness, so lit paper glows while
+    // ink stays dark -- which is what an edge-lit panel actually does.
     const screen = new THREE.Mesh(
       new THREE.PlaneGeometry(panelW, panelH),
-      // Basic, not Standard: e-ink is the light source of record here. Shading
-      // the panel would fight the firmware's own greys.
-      new THREE.MeshBasicMaterial({ map: this.tex, toneMapped: false })
+      new THREE.MeshStandardMaterial({
+        map: this.tex, roughness: 0.92, metalness: 0, envMapIntensity: 0.6,
+        emissiveMap: this.tex, emissive: 0x000000, emissiveIntensity: 0,
+      })
     );
     screen.position.set(cx, cy, faceZ + o.zLift);
     screen.name = 'cp-screen';
+    screen.receiveShadow = !!o.shadows;
     this.root.add(screen);
     this.screen = screen;
     this.panelRect = { w: panelW, h: panelH, cx, cy, sideGap, topGap };
 
+    // Light leaking past the glass edge onto the bezel when the frontlight is
+    // on: a soft additive halo just behind the panel plane, so only the ring
+    // around it shows. Invisible until the light comes on.
+    const halo = new THREE.Mesh(
+      new THREE.PlaneGeometry(panelW * 1.3, panelH * 1.2),
+      new THREE.MeshBasicMaterial({
+        map: this._haloTexture(), color: 0xffffff, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+      })
+    );
+    halo.position.set(cx, cy, faceZ + o.zLift - 0.02);
+    halo.name = 'cp-halo';
+    halo.renderOrder = 2;
+    this.root.add(halo);
+    this.halo = halo;
+
+    this._applyFrontlight(this.getFrontlight(), true);
     this._addButtons(ctr);
+  }
+
+  // Radial falloff for the frontlight halo; generated once, 128 px is plenty
+  // for a soft gradient that is only ever seen through additive blending.
+  _haloTexture() {
+    if (typeof document === 'undefined') return null;
+    const size = 128;
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const grad = ctx.createRadialGradient(size / 2, size / 2, size * 0.28, size / 2, size / 2, size * 0.5);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+
+  // Push firmware frontlight state into the panel's emissive term and the halo.
+  // Called every frame from the render loop; cheap when nothing changed.
+  _applyFrontlight(state, force = false) {
+    const same = !force && state.on === this.frontlight.on &&
+      state.brightness === this.frontlight.brightness && state.warmth === this.frontlight.warmth;
+    if (same) return false;
+    this.frontlight = { on: !!state.on, brightness: state.brightness | 0, warmth: state.warmth | 0 };
+    const { color, intensity } = frontlightEmissive(this.frontlight, this.opts.glow);
+    if (this.screen) {
+      const material = this.screen.material;
+      material.emissive.setRGB(color[0], color[1], color[2], THREE.LinearSRGBColorSpace);
+      material.emissiveIntensity = intensity;
+    }
+    if (this.halo) {
+      this.halo.material.color.setRGB(color[0], color[1], color[2], THREE.LinearSRGBColorSpace);
+      this.halo.material.opacity = Math.min(0.55, intensity * 0.25);
+      this.halo.visible = intensity > 0;
+    }
+    this._dirty = true;
+    return true;
+  }
+
+  // A shadow catcher under the device. Only the shadow renders (ShadowMaterial
+  // is otherwise invisible), so the background stays the page's own.
+  _addGround(size) {
+    const extent = Math.max(size.x, size.y, size.z) * 4;
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(extent, extent),
+      new THREE.ShadowMaterial({ opacity: 0.32, transparent: true })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -size.y / 2 - 0.6;
+    ground.receiveShadow = true;
+    ground.name = 'cp-ground';
+    this.scene.add(ground);
+    this.ground = ground;
+    // Fit the shadow camera to the device rather than the default 10-unit box.
+    const cam = this.keyLight.shadow.camera;
+    const half = Math.max(size.x, size.y, size.z) * 0.9;
+    cam.left = -half; cam.right = half; cam.top = half; cam.bottom = -half;
+    cam.near = 1; cam.far = 1200;
+    cam.updateProjectionMatrix();
   }
 
   // Pads over the device's controls so they can be raycast and pressed. Boxes
@@ -487,8 +612,11 @@ export class Device3D {
         this.panelRect.h = height;
       }
     }
-    this.texBuf = frame.pixels;
-    this.tex.image.data = frame.pixels;
+    // Ink and paper reflectances, not the framebuffer's absolute black/white.
+    // In place: the reader owns and reuses this buffer, and hands it over only
+    // when the frame actually changed, so this runs a few times a second.
+    this.texBuf = applyLut(frame.pixels, this.lut);
+    this.tex.image.data = this.texBuf;
     this.tex.needsUpdate = true;
     this.lastFrame = frame.frame;
     return true;
@@ -527,6 +655,7 @@ export class Device3D {
       // early-outs on an unchanged frame counter, and controls.update() is the
       // thing that advances damping (and fires 'change', setting _dirty).
       if (this.syncPanel()) this._dirty = true;
+      if (this.screen) this._applyFrontlight(this.getFrontlight());
       this.controls.update();
 
       if (!this._dirty) return;
@@ -555,7 +684,7 @@ export class Device3D {
     window.removeEventListener('resize', this._onResize);
     this._ro?.disconnect();
     this.controls.dispose();
-    const resources = new Set([this.tex]);
+    const resources = new Set([this.tex, this.envMap].filter(Boolean));
     this.scene.traverse((node) => {
       if (node.geometry) resources.add(node.geometry);
       const materials = node.material ? (Array.isArray(node.material) ? node.material : [node.material]) : [];

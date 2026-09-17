@@ -10,6 +10,7 @@ changed by this portability pass.
 | Piece | Interface | Dependencies |
 | --- | --- | --- |
 | `runtime/framebuffer.js` | `new FramebufferReader(getModule, isReady).read()` | None; TypeScript declarations included |
+| `runtime/frontlight.js` | `readFrontlight(module)`, `frontlightEmissive(state, glow)`, `einkLut()`, `applyLut()` | None; declarations included |
 | `runtime/filesystem.js` | `createFilesystemLoader({getFS, baseUrl, fetchImpl?, signal?, onProgress?})` | Fetch API and Emscripten FS; declarations included |
 | `examples/LivePanel.tsx` | React component inside an existing R3F `Canvas` | The host application's React, R3F and Three.js |
 | `three/cp3d.js` | `Device3D(host, options)`, `load()`, `start()`, `stop()`, `dispose()` | The vendored Three.js renderer; useful for standalone use |
@@ -82,9 +83,9 @@ page's HTML. Copy the entire generated reader directory, including `runtime/`,
 
 - The published library is the whole SD tree (three books, three SD font packs,
   the Oxford dictionary): 61.5 MiB of files served as 20.3 MiB after build-time
-  gzip, of which 9.2 MiB is fetched before the reader starts and the 11 MiB
-  dictionary streams afterwards. First boot on a 20 Mbit link measures about
-  7.7 s, against 33 s for the earlier 24 MiB illustrated-EPUB library. The
+  gzip, of which 7.3 MiB is fetched before the reader starts; the unselected
+  font packs and then the 11 MiB dictionary stream afterwards. First boot on a 20 Mbit link measures about
+  6.4 s, against 33 s for the earlier 24 MiB illustrated-EPUB library. The
   generated seed is about 2 KB instead of 4.55 MB. Silkscreen's "a few MB" copy
   still understates the download. True book-on-demand loading needs coordination
   with synchronous firmware file access; replacing `fetch` alone is insufficient.

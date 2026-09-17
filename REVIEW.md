@@ -98,8 +98,8 @@ Measured with a fresh Chrome profile against the deployed site, CDP-throttled to
 
 | | Before | After |
 | --- | --- | --- |
-| First visit to first frame (20 Mbit) | 33.3 s | 7.7 s |
-| Bytes before the first frame | 27.4 MiB | 12.3 MiB |
+| First visit to first frame (20 Mbit) | 33.3 s | 6.4 s |
+| Bytes before the first frame | 27.4 MiB | 10.3 MiB |
 | 3D view, idle or orbiting | 20 fps | 60 fps |
 
 - **The library blocked the boot, not the runtime.** The firmware itself reached
@@ -117,6 +117,19 @@ Measured with a fresh Chrome profile against the deployed site, CDP-throttled to
   library's filenames, so the home screen opened on an empty shelf. The build
   already drops recents whose books are absent; `scripts/capture-seed.mjs` now
   regenerates them by driving a real build, one book per clean session.
+- **Only the selected font family is needed before the first frame.**
+  `setup()` loads the family the settings name and clears the setting if it is
+  missing; the other packs (1.9 MiB gzipped) now stream in after boot, ahead of
+  the dictionary. Discovery ran once at boot, so the page calls the new
+  `cp_sd_fonts_changed()` export when the last one lands; the registry re-scans
+  on the next Settings visit, the same path a web-server font upload uses.
+- **Four pool workers, not eight.** Every pool worker loads and instantiates
+  the module before `main()` may run; the firmware starts one thread.
+- **Measured and rejected:** `-flto` (WASM grew from 5.51 to 5.92 MB, inlining
+  outweighing dead-code removal), `-Os`/`-O3`/no-assertions (under 1% gzipped),
+  and Emscripten lazy files for the books (they abort on the main thread, where
+  the firmware's file reads happen). The 5.7 MiB *Pride and Prejudice* EPUB is
+  now over half of the critical path; further gains are its images.
 - **`delay()` on the browser main thread was a busy-wait.** The firmware's
   `loop()` ends with `delay(10)`, or `delay(50)` after three idle seconds, and
   Emscripten cannot sleep the main thread, so it spun there — flooring every
@@ -125,6 +138,26 @@ Measured with a fresh Chrome profile against the deployed site, CDP-throttled to
   deadline (`cpwebDelayDeadline`) and the frame loop runs no firmware work until
   it passes, keeping the firmware's own pacing without holding the thread.
   Frames the render task finished are still flushed on those skipped frames.
+
+## 3D view: lit e-paper and the frontlight — 2026-09-17
+
+The panel used to be an unlit `MeshBasicMaterial` showing the framebuffer at
+full white: a backlit LCD. E-paper is reflective, so it is now a fully rough
+standard material lit by the scene, whose map is the framebuffer remapped
+through `einkLut()` to e-paper reflectances (white ≈ 222, black ≈ 52 in sRGB).
+The scene gets image-based lighting from three.js's `RoomEnvironment`, a key
+light with a soft shadow onto a shadow-catcher plane, ACES tone mapping, and a
+PBR case material in place of the earlier Phong.
+
+The firmware's frontlight is the only emissive term. `HalFrontlight` in the
+simulator already tracks on/brightness/warmth without touching the framebuffer,
+exactly like the hardware; the patch exports it (`cp_frontlight_*`) and
+`runtime/frontlight.js` maps it to an emissive colour (cool white to amber by
+warmth) and intensity (a 1.4-power curve of brightness). The same texture is
+the emissive map, so lit paper glows and ink stays dark, and a faint additive
+halo behind the glass leaks onto the bezel. The quick panel (status-bar tap,
+Enter toggles, Left/Right adjust) drives it live. `examples/LivePanel.tsx`
+carries the same treatment for Silkscreen.
 
 ## Validation
 

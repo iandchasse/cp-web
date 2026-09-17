@@ -26,6 +26,7 @@ import subprocess
 import sys
 import concurrent.futures
 import shutil
+import base64
 import functools
 import gzip
 import io
@@ -388,7 +389,10 @@ def link_model(model_id):
     link = [
         "em++", "-O2", "-pthread",
         "-sUSE_SDL=2",
-        "-sPTHREAD_POOL_SIZE=8",
+        # One worker for the firmware's render task, plus headroom: every
+        # worker in the pool loads and instantiates the module before main()
+        # may run, and eight of them were pure startup cost on phones.
+        "-sPTHREAD_POOL_SIZE=4",
         "-sALLOW_MEMORY_GROWTH=1",
         "-sINITIAL_MEMORY=134217728",
         "-sEXIT_RUNTIME=0",
@@ -463,6 +467,10 @@ def copy_fs(slim=False):
         selected = candidates if not slim else select_files(candidates, os.path.join(ROOT, "sd-profile.json"))
         with open(os.path.join(ROOT, "seed.json"), encoding="utf-8") as stream:
             seed = json.load(stream)
+        # The one SD font family the seeded settings select has to be present
+        # before the first frame (setup() loads it, or clears the selection).
+        # Every other family can stream in afterwards.
+        seeded_font = json.loads(base64.b64decode(seed["files"]["settings.json"])).get("sdFontFamilyName", "")
         # Always curate: the seed's recents, covers and font/dictionary choices
         # name specific files, and a seeded recent whose book is not in this
         # build is a home-screen card that opens nothing.
@@ -484,7 +492,10 @@ def copy_fs(slim=False):
         size = os.path.getsize(full)
         # Dictionaries are large and discovered lazily (only when Settings is
         # opened), so stream them after boot instead of blocking the first paint.
-        defer = rel.startswith("dictionaries/")
+        # Likewise font families other than the selected one: the page tells the
+        # firmware to re-scan once they land (cp_sd_fonts_changed).
+        defer = rel.startswith("dictionaries/") or (
+            rel.startswith("fonts/") and rel.split("/")[1] != seeded_font)
         total += size
         deferred += size if defer else 0
         entry = {"path": "/fs_/" + rel, "size": size, "defer": defer}
@@ -528,7 +539,9 @@ def copy_fs(slim=False):
             shutil.copy2(full, dst)
             entry["url"] = "fs/" + quote(rel, safe="/")
         files.append(entry)
-    files.sort(key=lambda e: e["path"])
+    # Eager files first; among the deferred, fonts before dictionaries so the
+    # Settings font list fills in seconds rather than after a 10 MB dictionary.
+    files.sort(key=lambda e: (e["defer"], not e["path"].startswith("/fs_/fonts/"), e["path"]))
     with open(os.path.join(DIST, "manifest.json"), "w") as f:
         json.dump({"version": 1, "files": files}, f, indent=2)
     with open(os.path.join(DIST, "seed.json"), "w", encoding="utf-8") as f:

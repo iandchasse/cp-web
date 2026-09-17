@@ -9,6 +9,7 @@ const files = [
   ['three/examples/jsm/controls/OrbitControls.js', 'OrbitControls.js'],
   ['three/examples/jsm/loaders/3MFLoader.js', '3MFLoader.js'],
   ['three/examples/jsm/utils/BufferGeometryUtils.js', 'BufferGeometryUtils.js'],
+  ['three/examples/jsm/environments/RoomEnvironment.js', 'RoomEnvironment.js'],
   ['fflate/esm/browser.js', 'fflate.module.js'],
   ['three/LICENSE', 'LICENSE.three'],
   ['fflate/LICENSE', 'LICENSE.fflate'],

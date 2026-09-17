@@ -248,6 +248,15 @@
       getFS: () => window.Module.FS,
       baseUrl: new URL('./', location.href),
       onProgress: pct => window.Module.setStatus('Loading filesystem… ' + pct + '%'),
+      // Font families other than the selected one stream in after boot. The
+      // firmware discovered fonts once in setup(), so once the last deferred
+      // font has landed, mark its registry dirty; Settings and the reader
+      // re-scan on their next visit, the same path a web-upload takes.
+      onDeferred: entry => {
+        if (!entry.path.startsWith('/fs_/fonts/')) return;
+        const fontsLeft = filesystem.pendingDeferred().some(file => file.path.startsWith('/fs_/fonts/'));
+        if (!fontsLeft && window.Module?._cp_sd_fonts_changed) window.Module._cp_sd_fonts_changed();
+      },
     });
     window.fsLoad = filesystem.state;
     // Start the SD download now, not in preRun: the WASM still has to arrive

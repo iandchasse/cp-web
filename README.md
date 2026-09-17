@@ -29,13 +29,14 @@ compression, of which only 9.2 MiB is fetched before the reader starts.
 | `build.py` | The whole build. Direct `emcc` compilation and `em++` linking — no PlatformIO. |
 | `switcher.html` | The page: model picker, 2D/3D toggle, boot loader, input routing. |
 | `three/` | Vendored three.js, `cp3d.js` (the 3D view), and `x4-device.3mf`. |
+| `runtime/frontlight.js` | Maps the firmware's frontlight to an emissive term; e-paper reflectance LUT. |
 | `shims/` | Host shims the firmware links against, incl. the sleep/wake reload. |
 | `seed.json` | Source first-visit state; curated at build time against the shipped library. |
 | `sd-profile.json` | Optional `--slim` allowlist: books only, no SD fonts or dictionary. |
 | `patches/` | Simulator changes not yet upstream (see below). |
 | `pins.env` | Firmware, simulator, Emscripten and ArduinoJson pins. |
 | `package.json`, `package-lock.json` | Pinned browser vendor tooling and libraries. |
-| `runtime/` | Framework-independent framebuffer/filesystem adapters, with TypeScript declarations. |
+| `runtime/` | Framework-independent framebuffer, frontlight and filesystem adapters, with TypeScript declarations. |
 | `examples/LivePanel.tsx` | Reuse the live panel in Silkscreen's React Three Fiber scene. |
 | `scripts/` | `bootstrap.ps1` (recreate the env), `pack-fs.ps1` (publish the SD tree), `capture-seed.mjs` (regenerate `seed.json`). |
 | `serve.py` | Local server, with flags to emulate awkward hosts. |
@@ -84,9 +85,11 @@ in MEMFS is byte-for-byte the source file:
 - **Splitting.** Anything still over 20 MiB is written as `.part-N` files and
   rejoined by the loader, because Cloudflare Pages rejects assets over 25 MiB.
 
-Dictionaries are marked `defer`, so they stream in after boot rather than
-blocking the first paint: 9.2 MiB is fetched before the reader starts and the
-11 MiB dictionary arrives while you read.
+Dictionaries and every font family except the one the seeded settings select
+are marked `defer`, so they stream in after boot rather than blocking the first
+paint: about 7.3 MiB is fetched before the reader starts, the other font packs
+land within seconds (the page then tells the firmware to re-scan its font
+registry, via `cp_sd_fonts_changed`), and the 11 MiB dictionary follows.
 
 ```sh
 python build.py fs             # update SD content and matching seed only

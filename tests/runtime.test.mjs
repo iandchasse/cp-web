@@ -173,3 +173,29 @@ test('compressed assets are inflated and checked against their real size', async
   const unknown = fixture([{ path: '/fs_/d', url: 'fs/d', size: 4, encoding: 'brotli' }]);
   await assert.rejects(unknown.loader.loadEager(), /Unsupported encoding/);
 });
+
+test('deferred files report progress in order so the page can act when a class completes', async () => {
+  const seen = [];
+  const files = [
+    { path: '/fs_/book', url: 'fs/book', size: 2 },
+    { path: '/fs_/fonts/A/a.cpfont', url: 'fs/a', size: 2, defer: true },
+    { path: '/fs_/fonts/B/b.cpfont', url: 'fs/b', size: 2, defer: true },
+    { path: '/fs_/dictionaries/d', url: 'fs/d', size: 2, defer: true },
+  ];
+  let loader;
+  loader = createFilesystemLoader({
+    baseUrl: 'https://example.test/',
+    getFS: () => ({ mkdirTree() {}, writeFile() {} }),
+    fetchImpl: async url => String(url).endsWith('manifest.json')
+      ? Response.json({ version: 1, files }) : new Response(Uint8Array.of(1, 2)),
+    onDeferred: (entry, remaining) => seen.push([entry.path, remaining,
+      loader.pendingDeferred().some(file => file.path.startsWith('/fs_/fonts/'))]),
+  });
+  await loader.loadEager();
+  await loader.loadDeferred();
+  assert.deepEqual(seen, [
+    ['/fs_/fonts/A/a.cpfont', 2, true],
+    ['/fs_/fonts/B/b.cpfont', 1, false],   // last font: no fonts pending any more
+    ['/fs_/dictionaries/d', 0, false],
+  ]);
+});

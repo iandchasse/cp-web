@@ -1,6 +1,6 @@
 /** Load the loose SD tree into any Emscripten FS; no DOM or window globals. */
-export function createFilesystemLoader({ getFS, baseUrl, fetchImpl = fetch, onProgress = () => {}, signal,
-                                         concurrency = 4 }) {
+export function createFilesystemLoader({ getFS, baseUrl, fetchImpl = fetch, onProgress = () => {},
+                                         onDeferred = () => {}, signal, concurrency = 4 }) {
   const base = new URL(baseUrl);
   const state = { eagerPct: 0, deferTotal: 0, deferDone: 0, ready: false, error: null };
   let deferred = [];
@@ -119,10 +119,17 @@ export function createFilesystemLoader({ getFS, baseUrl, fetchImpl = fetch, onPr
     }
   }
 
+  /** Stream the deferred set after boot. onDeferred(entry, remaining) fires as
+   * each file lands, with how many deferred files are still to come, so the
+   * page can nudge the firmware once a whole class of files (fonts) is in. */
   async function loadDeferred() {
     if (state.error) return;
     try {
-      for (const file of deferred) { await fetchEntry(file); state.deferDone++; }
+      for (const file of deferred) {
+        await fetchEntry(file);
+        state.deferDone++;
+        onDeferred(file, deferred.length - state.deferDone);
+      }
       state.ready = true;
     } catch (error) {
       state.error = String(error);
@@ -130,5 +137,8 @@ export function createFilesystemLoader({ getFS, baseUrl, fetchImpl = fetch, onPr
     }
   }
 
-  return { state, prefetch, loadEager, loadDeferred };
+  /** Deferred entries not yet written, in the order they will arrive. */
+  const pendingDeferred = () => deferred.slice(state.deferDone);
+
+  return { state, prefetch, loadEager, loadDeferred, pendingDeferred };
 }

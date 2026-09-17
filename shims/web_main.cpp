@@ -21,6 +21,7 @@
 #include "Arduino.h"
 #include "HalDisplay.h"
 #include "HalGPIO.h"
+#include "SdCardFontSystem.h"
 #include "SimulatorLifecycle.h"
 
 extern void setup();
@@ -55,6 +56,15 @@ EM_JS(void, cpweb_persist_and_reload, (), {
 EM_JS(void, cpweb_signal_first_frame, (), {
   if (window.cpwebFirstFrame) window.cpwebFirstFrame();
 });
+
+// The page streams SD font packs in after boot rather than holding startup for
+// them (only the family the settings select is needed before the first frame).
+// Font discovery runs once in setup(), so tell the registry the card changed;
+// it re-scans the next time Settings or the reader asks for fonts, exactly as
+// it does after a web-server font upload.
+extern "C" EMSCRIPTEN_KEEPALIVE void cp_sd_fonts_changed() {
+  sdFontSystem.markRegistryDirty();
+}
 
 // Flush a frame the render task finished, and announce the very first one so
 // the page can drop its "Waking..." splash. Every path that presents goes
