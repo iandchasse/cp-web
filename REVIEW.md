@@ -144,7 +144,13 @@ Measured with a fresh Chrome profile against the deployed site, CDP-throttled to
 The panel used to be an unlit `MeshBasicMaterial` showing the framebuffer at
 full white: a backlit LCD. E-paper is reflective, so it is now a fully rough
 standard material lit by the scene, whose map is the framebuffer remapped
-through `einkLut()` to e-paper reflectances (white ≈ 236, black ≈ 34 in sRGB).
+through `einkLut()` to e-paper reflectances (white 200, black 36), with the
+panel's albedo scaled (`PANEL_ALBEDO`, 0.3) so unlit paper renders at about 193
+sRGB: under the case's key light and environment it otherwise saturated to
+white and the frontlight had nothing to add. three.js cannot light objects
+selectively (light layers are culled per camera), so the albedo is the lever;
+the value was calibrated by measuring renders. Measured ladder, cool white:
+off 193, 10% 213, 40% 231, 100% 240 (blue channel 249); warm 100% 249/222/195.
 The scene gets image-based lighting from three.js's `RoomEnvironment`, a key
 light with a soft shadow onto a shadow-catcher plane, Neutral (Khronos PBR)
 tone mapping, and a PBR case material in place of the earlier Phong. ACES was

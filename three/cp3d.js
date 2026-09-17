@@ -26,6 +26,14 @@ import { readFrontlight, frontlightEmissive, einkLut, applyLut } from '../runtim
 
 const MODEL_URL = new URL('./x4-device.3mf', import.meta.url);
 
+// How much of the rig's light the panel keeps. Under the case's key light and
+// environment the paper saturated to white on its own, leaving the frontlight
+// nothing to add. three.js cannot light objects selectively (light layers are
+// culled per camera, not per object), so the panel's albedo is scaled instead:
+// calibrated by measuring rendered paper from the default view: 0.2 -> 162,
+// 0.3 -> 193, 0.4 -> 218 (sRGB), with the frontlight adding on top of that.
+const PANEL_ALBEDO = 0.3;
+
 // Geometry measured off the mesh itself by measure_model.mjs, in millimetres and
 // in the model's own frame (before the load() centring). Hardcoded rather than
 // re-derived at runtime because finding these needs dense surface sampling --
@@ -77,10 +85,10 @@ const DEFAULTS = {
   // ink and paper are diffuse surfaces under the scene's lights, and only the
   // firmware's frontlight adds glow. These are the reflectances (sRGB) the
   // framebuffer's pure white and black map to, and how strong 100% light is.
-  einkWhite: 236,
-  einkBlack: 34,
-  glow: 1.8,      // emissive at 100%: well past paper white, so a lit panel reads as lit
-  exposure: 1.15, // overall scene brightness; e-paper in a bright room, not overcast
+  einkWhite: 200, // paper's reflectance relative to ink; on screen it lands near 193 unlit
+  einkBlack: 36,
+  glow: 1.6,      // emissive at 100%: takes grey paper to white and a little past
+  exposure: 1.1,  // overall scene brightness; e-paper in a bright room, not overcast
   shadows: true,
 };
 
@@ -328,7 +336,8 @@ export class Device3D {
     const screen = new THREE.Mesh(
       new THREE.PlaneGeometry(panelW, panelH),
       new THREE.MeshStandardMaterial({
-        map: this.tex, roughness: 0.85, metalness: 0, envMapIntensity: 0.8,
+        map: this.tex, roughness: 0.85, metalness: 0, envMapIntensity: 0.45,
+        color: new THREE.Color().setRGB(PANEL_ALBEDO, PANEL_ALBEDO, PANEL_ALBEDO, THREE.LinearSRGBColorSpace),
         emissiveMap: this.tex, emissive: 0x000000, emissiveIntensity: 0,
       })
     );
