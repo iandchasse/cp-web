@@ -174,7 +174,8 @@
   <div id="stage3d"><div id="hint3d">drag the screen to swipe &middot; drag off it to orbit &middot; click the rockers &amp; side buttons &middot; scroll to zoom</div></div>
   <div class="legend" id="legend"></div>
   <div id="status">preparing WebAssembly&hellip;</div>
-  <script>
+  <script type="module">
+    import { createFilesystemLoader } from './runtime/filesystem.js';
     var statusEl = document.getElementById('status');
     var spinnerEl = document.getElementById('spinner');
     var canvasEl = document.getElementById('canvas');
@@ -191,18 +192,21 @@
       try { waking = sessionStorage.getItem('cpweb_waking') === '1'; sessionStorage.removeItem('cpweb_waking'); } catch (e) {}
       if (waking && ov) ov.classList.add('show');
       var hidden = false;
+      function hideSplash() {
+        if (hidden || !ov) return; hidden = true;
+        ov.classList.add('hide');
+        setTimeout(function () { ov.classList.remove('show', 'hide'); }, 450);
+      }
       window.cpwebFirstFrame = function () {
         // Also the readiness latch for anything that calls into the WASM
         // exports: before the runtime is initialised those symbols exist as
         // stubs that abort on call, so "is the function defined?" is not a
         // safe test. A painted frame proves the runtime is live.
         window.__cpFirstFrame = true;
-        if (hidden || !ov) return; hidden = true;
-        ov.classList.add('hide');
-        setTimeout(function () { ov.classList.remove('show', 'hide'); }, 450);
+        hideSplash();
       };
       // Safety net: never leave the splash stuck if boot stalls.
-      if (waking) setTimeout(window.cpwebFirstFrame, 15000);
+      if (waking) setTimeout(hideSplash, 15000);
     })();
 
     // Integer-scale the portrait panel to the largest whole multiple that fits
@@ -219,21 +223,19 @@
       var availW = window.innerWidth - 20;
       var availH = window.innerHeight - chromeH;
       var scale = Math.min(availW / nativeW, availH / nativeH);
-      scale = Math.max(1, Math.floor(scale)); // integer increments, min 1x
+      scale = scale >= 1 ? Math.floor(scale) : Math.max(0.1, scale);
       canvasEl.style.width = (nativeW * scale) + 'px';
       canvasEl.style.height = (nativeH * scale) + 'px';
     }
-    // Recompute whenever the backing store or the window size changes.
-    var lastKey = '';
-    function watch() {
-      var key = canvasEl.width + 'x' + canvasEl.height + '@' +
-                window.innerWidth + 'x' + window.innerHeight + '@' +
-                (window.devicePixelRatio || 1);
-      if (key !== lastKey) { lastKey = key; fitPanel(); }
-      requestAnimationFrame(watch);
-    }
+    // Observe actual layout/backing-store changes instead of polling at 60 Hz.
+    new MutationObserver(fitPanel).observe(canvasEl, {
+      attributes: true, attributeFilter: ['width', 'height'],
+    });
+    const panelLayout = new ResizeObserver(fitPanel);
+    panelLayout.observe(document.getElementById('title'));
+    panelLayout.observe(document.getElementById('legend'));
     window.addEventListener('resize', fitPanel);
-    requestAnimationFrame(watch);
+    fitPanel();
 
     // --- Loose-file filesystem loader -----------------------------------
     // The SD-card tree (fonts/books/dictionaries) is served as individual
@@ -242,70 +244,14 @@
     // books) are written into MEMFS before main() via an Emscripten run
     // dependency; deferred files (dictionaries) stream in the background after
     // boot and are picked up lazily when the user opens Settings.
-    window.fsLoad = { eagerPct: 0, deferTotal: 0, deferDone: 0, ready: false, error: null };
-
-    function fsWrite(path, u8) {
-      var slash = path.lastIndexOf('/');
-      var dir = slash > 0 ? path.substring(0, slash) : '/';
-      try { Module.FS.mkdirTree(dir); } catch (e) {}
-      Module.FS.writeFile(path, u8);
-    }
-
-    function fsFetch(entry) {
-      var urls = entry.parts || [entry.url];   // {parts:[...]} => concatenate
-      return Promise.all(urls.map(function (u) {
-        return fetch(u, { cache: 'force-cache' }).then(function (r) {
-          if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + u);
-          return r.arrayBuffer();
-        });
-      })).then(function (bufs) {
-        var len = bufs.reduce(function (a, b) { return a + b.byteLength; }, 0);
-        var out = new Uint8Array(len), off = 0;
-        bufs.forEach(function (b) { out.set(new Uint8Array(b), off); off += b.byteLength; });
-        fsWrite(entry.path, out);
-      });
-    }
-
-    function fsManifest() {
-      return fetch('manifest.json', { cache: 'no-store' })
-        .then(function (r) { return r.ok ? r.json() : { files: [] }; })
-        .then(function (m) { return (m && m.files) || []; });
-    }
-
-    // Eager pass: blocks main() until fonts/books are in MEMFS (fonts are
-    // discovered at boot). Sequential keeps memory flat + progress monotonic.
-    function fsLoadEager() {
-      return fsManifest().then(function (files) {
-        window.__fsAll = files;
-        var eager = files.filter(function (f) { return !f.defer; });
-        window.__fsDeferred = files.filter(function (f) { return f.defer; });
-        var total = eager.reduce(function (a, f) { return a + (f.size || 0); }, 0) || 1;
-        var loaded = 0;
-        return eager.reduce(function (p, f) {
-          return p.then(function () {
-            return fsFetch(f).then(function () {
-              loaded += (f.size || 0);
-              window.fsLoad.eagerPct = Math.round(loaded / total * 100);
-              if (Module.setStatus) Module.setStatus('Loading filesystem\u2026 ' + window.fsLoad.eagerPct + '%');
-            });
-          });
-        }, Promise.resolve());
-      });
-    }
-
-    // Deferred pass: runs after boot; dictionaries land while the user reads,
-    // and DictionaryRegistry::discover (opened from Settings) finds them then.
-    function fsLoadDeferred() {
-      var d = window.__fsDeferred || [];
-      window.fsLoad.deferTotal = d.length;
-      if (!d.length) { window.fsLoad.ready = true; return; }
-      d.reduce(function (p, f) {
-        return p.then(function () { return fsFetch(f).then(function () { window.fsLoad.deferDone++; }); });
-      }, Promise.resolve()).then(function () {
-        window.fsLoad.ready = true;
-        console.log('[fs] deferred assets ready (' + d.length + ' files)');
-      }).catch(function (e) { window.fsLoad.error = String(e); console.error('[fs] deferred load failed', e); });
-    }
+    const filesystem = createFilesystemLoader({
+      getFS: () => window.Module.FS,
+      baseUrl: new URL('./', location.href),
+      onProgress: pct => window.Module.setStatus('Loading filesystem… ' + pct + '%'),
+    });
+    window.fsLoad = filesystem.state;
+    const fsLoadEager = () => filesystem.loadEager();
+    const fsLoadDeferred = () => filesystem.loadDeferred().catch(error => console.error('[fs]', error));
 
     // --- First-visit default state (seed) -------------------------------
     // The firmware's runtime state (/.crosspoint: settings, recent list, cover
@@ -388,7 +334,9 @@
           window.fsLoad.error = String(e);
           console.error('[fs] eager load failed', e);
           if (Module.setStatus) Module.setStatus('Filesystem load failed: ' + e.message);
-          Module.removeRunDependency('fs-loose'); // boot anyway (empty FS)
+          spinnerEl.style.display = 'none';
+          // Keep startup blocked: partially loaded fonts/books are not a valid
+          // library, and starting main() would erase the useful error status.
         });
       }],
       onRuntimeInitialized: function () { canvasEl.focus(); fitPanel(); fsLoadDeferred(); }
@@ -417,7 +365,7 @@
     // explicit sleep/wake path persists on its own before reloading.
     var __cpwebSyncing = false;
     function cpwebSyncState() {
-      if (__cpwebSyncing || !window.Module || !Module.FS || !Module.FS.syncfs) return;
+      if (!window.__cpFirstFrame || __cpwebSyncing || !window.Module || !Module.FS || !Module.FS.syncfs) return;
       __cpwebSyncing = true;
       try {
         Module.FS.syncfs(false, function (err) {
@@ -456,13 +404,28 @@
         p.set('model', sel.value);
         location.search = p.toString(); // reload with the chosen model
       };
+      // Nothing to choose between with a single model; keep the 3D toggle.
+      var single = models.length < 2;
+      sel.hidden = single;
+      document.querySelector('label[for="modelSel"]').hidden = single;
       document.getElementById('note').textContent = current.note || '';
       document.getElementById('dims').textContent = current.w + '\u00d7' + current.h;
       document.title = 'CrossPoint Reader — ' + current.label;
     }
 
     // Load the model list, wire the UI, then inject the selected WASM bundle.
-    fetch('models.json', { cache: 'no-store' })
+    if (!window.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') {
+      statusEl.style.pointerEvents = 'auto';
+      statusEl.textContent = window.top !== window.self
+        ? 'This embedded reader needs an isolated host page. '
+        : 'Waiting for browser isolation. Use HTTPS or localhost with COOP/COEP headers. ';
+      const open = document.createElement('a');
+      open.href = location.href;
+      open.target = '_blank';
+      open.rel = 'noopener';
+      open.textContent = 'Open reader in a new tab';
+      statusEl.appendChild(open);
+    } else fetch('models.json', { cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (models) {
         if (!models || !models.length) { throw new Error('empty'); }
@@ -473,6 +436,7 @@
         }
         if (!model) { model = models[0]; }
 
+        window.__cpModel = model;
         buildSelector(models, model);
         buildLegend(model);
         canvasEl.width = model.w;
@@ -497,9 +461,6 @@
   <!-- 3D device view. Loaded as a module so it can be tree-shaken out of the
        2D path entirely: nothing here runs, and three.js is never fetched,
        unless the user actually presses the button. -->
-  <script type="importmap">
-    { "imports": { "three": "./three/three.module.min.js" } }
-  </script>
   <script type="module">
     const btn = document.getElementById('view3d');
     const stage = document.getElementById('stage3d');
@@ -546,10 +507,17 @@
       setNote('loading 3D\u2026');
       try {
         const { Device3D } = await import('./three/cp3d.js');
-        dev = new Device3D(stage, { fbW: 800, fbH: 480 });
+        const model = window.__cpModel;
+        const calibration = {};
+        const params = new URLSearchParams(location.search);
+        for (const key of ['panelW', 'topGap', 'zLift']) {
+          const value = parseFloat(params.get(key));
+          if (Number.isFinite(value)) calibration[key] = value;
+        }
+        dev = new Device3D(stage, { fbW: model?.h || 800, fbH: model?.w || 480, ...calibration });
         window.__dev3d = dev;   // handy for calibration from the console
         const info = await dev.load((m) => setNote(m));
-        dev.start();
+        if (window.__mode3d) dev.start();
         setNote(info.tris.toLocaleString() + ' tris');
 
         // Pointer routing. These sit on the stage in the *capture* phase so they
@@ -559,30 +527,31 @@
         // panel and the buttons is left alone and orbits as usual.
         let drag = null;
         const onDown = (e) => {
+          if (drag || e.button !== 0) return;
           const hit = dev.pick(e.clientX, e.clientY);
           if (!hit) return;                  // off the device -> orbit
           e.stopPropagation();
           e.preventDefault();
           try { stage.setPointerCapture(e.pointerId); } catch (_) {}
           if (hit.kind === 'button') {
-            drag = { kind: 'button', button: hit.button, mesh: hit.mesh };
+            drag = { pointerId: e.pointerId, kind: 'button', button: hit.button, mesh: hit.mesh };
             dev.setButtonActive(hit.mesh, true);
             forwardKey('keydown', hit.button);
           } else {
-            drag = { kind: 'screen', last: hit.uv };
+            drag = { pointerId: e.pointerId, kind: 'screen', last: hit.uv };
             forwardToCanvas('mousemove', hit.uv);
             forwardToCanvas('mousedown', hit.uv);
           }
         };
         const onMove = (e) => {
-          if (!drag) return;
+          if (!drag || drag.pointerId !== e.pointerId) return;
           e.stopPropagation();
           if (drag.kind !== 'screen') return;
           const uv = dev.projectToPanel(e.clientX, e.clientY);
           if (uv) { drag.last = uv; forwardToCanvas('mousemove', uv); }
         };
         const onUp = (e) => {
-          if (!drag) return;
+          if (!drag || drag.pointerId !== e.pointerId) return;
           e.stopPropagation();
           if (drag.kind === 'button') {
             forwardKey('keyup', drag.button);
@@ -598,10 +567,13 @@
         stage.addEventListener('pointermove', onMove, true);
         stage.addEventListener('pointerup', onUp, true);
         stage.addEventListener('pointercancel', onUp, true);
+        stage.addEventListener('lostpointercapture', onUp, true);
       } catch (err) {
         console.error('[3d] failed', err);
         setNote('3D failed: ' + err.message);
+        dev?.dispose();
         dev = null;
+        window.__dev3d = null;
       } finally { loading = false; }
     }
 
@@ -610,7 +582,7 @@
       deviceEl.classList.toggle('offstage', on);
       btn.setAttribute('aria-pressed', String(on));
       btn.textContent = on ? '2D view' : '3D view';
-      if (on) { enable3d().then(() => { if (dev) { dev.start(); dev.resize(); } }); }
+      if (on) { enable3d().then(() => { if (dev && window.__mode3d) { dev.start(); dev.resize(); } }); }
       else { if (dev) dev.stop(); setNote(''); }
       // Keep keystrokes going to the reader in either mode.
       canvasEl.focus({ preventScroll: true });

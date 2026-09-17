@@ -10,14 +10,15 @@ fetched into MEMFS at boot by the page loader. Networking is shimmed (no live
 sockets).
 
 Usage (after dot-sourcing emsdk_env.ps1 so emcc is on PATH):
-  python build.py all           # build every model + copy page + loose fs
-  python build.py model x4pro   # build a single model (x4 | x4pro | x3)
+  python build.py all           # build every enabled model + copy page + loose fs
+  python build.py model x4pro   # build a single enabled model
   python build.py page          # (re)copy page + models.json + loose fs + _headers
   python build.py fs            # (re)mirror fs_ into dist/fs + manifest.json only
   python build.py clean         # remove objects + dist
 
 Flags:
   --skip-fs   don't mirror fs_ (CI builds the 134 MB SD tree separately)
+  --full-fs   include the original SD tree and seed instead of sd-profile.json
 """
 import os
 import re
@@ -25,6 +26,9 @@ import subprocess
 import sys
 import concurrent.futures
 import shutil
+import functools
+from urllib.parse import quote
+from sd_content import select_files, curate_seed
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -89,7 +93,11 @@ MODELS = {
         "note": "Keyboard only. 3.7\" 3:2 panel.",
     },
 }
-DEFAULT_MODEL = "x4"
+DEFAULT_MODEL = "x4pro"
+
+# Models that are built, advertised in models.json and deployed. The others stay
+# defined above but are stashed; add an id back here to restore it.
+ENABLED_MODELS = ["x4pro"]
 
 # Source-path exclusions (relative substrings, matched case-insensitively with
 # forward slashes). Mirrors build_src_filter minus-entries plus host tests/tools.
@@ -253,7 +261,7 @@ def is_up_to_date(out, cmd):
         return False
     try:
         with open(out + ".cmd", "r", encoding="utf-8") as f:
-            if f.read() != "\n".join(cmd):
+            if f.read() != command_signature(cmd):
                 return False
     except OSError:
         return False
@@ -265,6 +273,18 @@ def is_up_to_date(out, cmd):
         return all(os.path.getmtime(d) <= out_mtime for d in deps)
     except OSError:
         return False
+
+
+@functools.lru_cache(maxsize=1)
+def compiler_identity():
+    return (os.path.realpath(shutil.which("emcc") or "emcc") + "\n" +
+            subprocess.check_output(["emcc", "--version"], text=True))
+
+
+def command_signature(cmd):
+    # emsdk upgrades replace the executable at the same path. The command alone
+    # cannot tell old objects from ones built with the newly activated compiler.
+    return compiler_identity() + "\n" + "\n".join(cmd)
 
 
 def compile_one(task):
@@ -286,11 +306,12 @@ def compile_one(task):
                 os.remove(f)
     else:
         with open(out + ".cmd", "w", encoding="utf-8") as f:
-            f.write("\n".join(cmd))
+            f.write(command_signature(cmd))
     return (src, p.returncode, p.stderr)
 
 
 def compile_model(model_id):
+    compiler_identity()  # Prime the cached version before starting workers.
     m = MODELS[model_id]
     def_flags = [f"-D{d}" for d in (DEFINES + m["defines"])]
     objdir = os.path.join(OBJ, model_id)
@@ -325,17 +346,18 @@ def compile_model(model_id):
 
 def link_model(model_id):
     objdir = os.path.join(OBJ, model_id)
-    objs = []
-    for dp, _, files in os.walk(objdir):
-        for f in files:
-            if f.endswith(".o"):
-                objs.append(os.path.join(dp, f))
+    # Removed/renamed sources leave old objects behind. Never link those.
+    objs = [obj_path(src, objdir) for src in collect_sources()]
     if not objs:
         print(f"[{model_id}] no objects; compile first")
         return 1
+    missing = [obj for obj in objs if not os.path.isfile(obj)]
+    if missing:
+        print(f"[{model_id}] {len(missing)} objects missing; compile first")
+        return 1
     os.makedirs(DIST, exist_ok=True)
     link = [
-        "emcc", "-O2", "-pthread",
+        "em++", "-O2", "-pthread",
         "-sUSE_SDL=2",
         "-sPTHREAD_POOL_SIZE=8",
         "-sALLOW_MEMORY_GROWTH=1",
@@ -388,7 +410,7 @@ def _iter_fs_files():
             yield full, rel
 
 
-def copy_fs():
+def copy_fs(full_fs=False):
     """Mirror the fs_ tree into dist/fs as loose static files and emit
     manifest.json. The page loader fetches these into MEMFS at boot instead of a
     baked .data package (25 MiB Cloudflare Pages asset cap).
@@ -404,12 +426,28 @@ def copy_fs():
     loader concatenates them) or an absolute R2 "url"; no loader change needed.
     """
     import json
+    if not os.path.isdir(FSROOT):
+        print(f"[fs] ERROR: {FSROOT} missing; existing output preserved")
+        return 1
+    candidates = list(_iter_fs_files())
+    try:
+        selected = candidates if full_fs else select_files(candidates, os.path.join(ROOT, "sd-profile.json"))
+        with open(os.path.join(ROOT, "seed.json"), encoding="utf-8") as stream:
+            seed = json.load(stream)
+        if not full_fs:
+            seed = curate_seed(seed, [rel for _, rel in selected])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"[fs] ERROR: {error}; existing output preserved")
+        return 1
     os.makedirs(DIST, exist_ok=True)
     fsout = os.path.join(DIST, "fs")
     if os.path.isdir(fsout):
+        # Never follow an unexpected output symlink/junction outside dist/.
+        if os.path.normcase(os.path.realpath(fsout)) != os.path.normcase(os.path.abspath(fsout)):
+            raise ValueError(f"Refusing to replace redirected output: {fsout}")
         shutil.rmtree(fsout)
     files, total, deferred = [], 0, 0
-    for full, rel in _iter_fs_files():
+    for full, rel in selected:
         dst = os.path.join(fsout, rel.replace("/", os.sep))
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(full, dst)
@@ -419,17 +457,22 @@ def copy_fs():
         defer = rel.startswith("dictionaries/")
         total += size
         deferred += size if defer else 0
-        files.append({"path": "/fs_/" + rel, "url": "fs/" + rel,
+        files.append({"path": "/fs_/" + rel, "url": "fs/" + quote(rel, safe="/"),
                       "size": size, "defer": defer})
     files.sort(key=lambda e: e["path"])
     with open(os.path.join(DIST, "manifest.json"), "w") as f:
         json.dump({"version": 1, "files": files}, f, indent=2)
+    with open(os.path.join(DIST, "seed.json"), "w", encoding="utf-8") as f:
+        json.dump(seed, f, separators=(",", ":"))
+    selected_paths = {rel for _, rel in selected}
+    omitted = sum(os.path.getsize(path) for path, rel in candidates if rel not in selected_paths)
     print(f"[fs] {len(files)} loose files -> dist/fs "
           f"({total/1048576:.1f} MB total, {deferred/1048576:.1f} MB deferred)")
+    print(f"[fs] {'full' if full_fs else 'demo'} profile: omitted {omitted/1048576:.1f} MB; source fs_/ unchanged")
     return 0
 
 
-def copy_page(built=None, skip_fs=False):
+def copy_page(built=None, skip_fs=False, full_fs=False):
     """Copy the switcher HTML + COI service worker into dist/, and write
     models.json describing which model bundles are available."""
     import json
@@ -440,8 +483,9 @@ def copy_page(built=None, skip_fs=False):
     sw = os.path.join(ROOT, "coi-serviceworker.js")
     if os.path.exists(sw):
         shutil.copy(sw, os.path.join(DIST, "coi-serviceworker.js"))
+    shutil.copytree(os.path.join(ROOT, "runtime"), os.path.join(DIST, "runtime"), dirs_exist_ok=True)
     # three.js + the device model for the 3D view. Copied wholesale rather than
-    # bundled: the page pulls these in via an importmap only when the user
+    # bundled: the page imports these modules only when the user
     # actually turns 3D on, so the 2D path never pays for them.
     three_src = os.path.join(ROOT, "three")
     if os.path.isdir(three_src):
@@ -463,11 +507,18 @@ def copy_page(built=None, skip_fs=False):
     # Optional first-visit default state applied by the loader when IDBFS is
     # empty (Lyra Extended theme, recents + covers, font/dictionary/sleep).
     seed = os.path.join(ROOT, "seed.json")
-    if os.path.exists(seed):
+    if os.path.exists(seed) and not os.path.exists(os.path.join(DIST, "seed.json")):
         shutil.copy(seed, os.path.join(DIST, "seed.json"))
+    # Stashed bundles left over from earlier builds must not be deployed.
+    for mid in MODELS:
+        if mid not in ENABLED_MODELS:
+            for ext in (".js", ".wasm"):
+                stale = os.path.join(DIST, mid + ext)
+                if os.path.exists(stale):
+                    os.remove(stale)
     # Only advertise models whose JS bundle actually exists in dist/.
     if built is None:
-        built = [mid for mid in MODELS
+        built = [mid for mid in ENABLED_MODELS
                  if os.path.exists(os.path.join(DIST, f"{mid}.js"))]
     manifest = [{
         "id": mid,
@@ -476,7 +527,7 @@ def copy_page(built=None, skip_fs=False):
         "h": MODELS[mid]["h"],
         "touch": MODELS[mid]["touch"],
         "note": MODELS[mid]["note"],
-    } for mid in MODELS if mid in built]
+    } for mid in ENABLED_MODELS if mid in built]
     with open(os.path.join(DIST, "models.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     print(f"[page] index.html + models.json ({', '.join(built) or 'none'})")
@@ -495,8 +546,7 @@ def copy_page(built=None, skip_fs=False):
     if not os.path.isdir(FSROOT):
         print(f"[page] ERROR: {FSROOT} missing and --skip-fs not given")
         return 1
-    copy_fs()
-    return 0
+    return copy_fs(full_fs=full_fs)
 
 
 def cmd_clean():
@@ -511,31 +561,34 @@ if __name__ == "__main__":
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     skip_fs = "--skip-fs" in flags
+    full_fs = "--full-fs" in flags
     cmd = argv[0] if argv else "all"
     if cmd == "clean":
         sys.exit(cmd_clean())
     elif cmd == "page":
-        sys.exit(copy_page(skip_fs=skip_fs))
+        sys.exit(copy_page(skip_fs=skip_fs, full_fs=full_fs))
     elif cmd == "fs":
-        sys.exit(copy_fs())
+        sys.exit(copy_fs(full_fs=full_fs))
     elif cmd == "model":
-        if len(argv) < 2 or argv[1] not in MODELS:
-            print("usage: build.py model <" + " | ".join(MODELS) + ">")
+        if len(argv) < 2 or argv[1] not in ENABLED_MODELS:
+            print("usage: build.py model <" + " | ".join(ENABLED_MODELS) + ">")
+            if len(argv) >= 2 and argv[1] in MODELS:
+                print(f"{argv[1]} is stashed; add it to ENABLED_MODELS to build it")
             sys.exit(2)
         mid = argv[1]
         rc = build_model(mid)
         if rc == 0:
-            copy_page(skip_fs=skip_fs)
+            rc = copy_page(skip_fs=skip_fs, full_fs=full_fs)
         sys.exit(rc)
     elif cmd == "all":
         built = []
-        for mid in MODELS:
+        for mid in ENABLED_MODELS:
             if build_model(mid) == 0:
                 built.append(mid)
             else:
                 print(f"[all] {mid} FAILED")
-        copy_page(built, skip_fs=skip_fs)
-        sys.exit(0 if len(built) == len(MODELS) else 1)
+        page_rc = copy_page(built, skip_fs=skip_fs, full_fs=full_fs)
+        sys.exit(0 if len(built) == len(ENABLED_MODELS) and page_rc == 0 else 1)
     else:
         print(__doc__)
         sys.exit(2)

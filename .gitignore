@@ -19,6 +19,7 @@ thirdparty/
 shots/
 node_modules/
 __pycache__/
+*.log
 *.zip
 *.part-*
 fs-content.tar.zst

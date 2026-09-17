@@ -26,9 +26,8 @@
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
 
-# Long-cache the immutable filesystem assets (content-addressed by path). Bump
-# the path or filename to bust the cache when you change a file.
+# Filenames are mutable, so revalidate instead of retaining stale books/fonts.
 /fs/*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
-  Cache-Control: public, max-age=31536000, immutable
+  Cache-Control: public, max-age=0, must-revalidate

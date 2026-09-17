@@ -20,8 +20,9 @@
 import * as THREE from './three.module.min.js';
 import { ThreeMFLoader } from './3MFLoader.js';
 import { OrbitControls } from './OrbitControls.js';
+import { FramebufferReader } from '../runtime/framebuffer.js';
 
-const MODEL_URL = './three/x4-device.3mf';
+const MODEL_URL = new URL('./x4-device.3mf', import.meta.url);
 
 // Geometry measured off the mesh itself by measure_model.mjs, in millimetres and
 // in the model's own frame (before the load() centring). Hardcoded rather than
@@ -72,20 +73,17 @@ const DEFAULTS = {
   zLift: 0.05,    // how far the panel floats above the face plane
 };
 
-function readOverrides() {
-  const q = new URLSearchParams(location.search);
-  const out = Object.assign({}, DEFAULTS);
-  for (const k of Object.keys(DEFAULTS)) {
-    const v = parseFloat(q.get(k));
-    if (Number.isFinite(v)) out[k] = v;
-  }
-  return out;
-}
-
 export class Device3D {
-  constructor(host, opts) {
+  constructor(host, opts = {}) {
     this.host = host;
-    this.opts = readOverrides();
+    this.opts = { ...DEFAULTS, ...opts };
+    this.modelUrl = opts.modelUrl || MODEL_URL;
+    this.framebuffer = new FramebufferReader(
+      opts.getModule || (() => window.Module),
+      opts.isReady || (() => !!window.__cpFirstFrame),
+    );
+    this._abort = new AbortController();
+    this._disposed = false;
     // Physical panel size. The framebuffer is always the landscape panel; the
     // firmware rotates content into it (see cp_fb_orientation below).
     this.fbW = (opts && opts.fbW) || 800;
@@ -204,10 +202,11 @@ export class Device3D {
 
   async load(onProgress) {
     const loader = new ThreeMFLoader();
-    const buf = await fetch(MODEL_URL).then((r) => {
+    const buf = await fetch(this.modelUrl, { signal: this._abort.signal }).then((r) => {
       if (!r.ok) throw new Error('model fetch failed: ' + r.status);
       return r.arrayBuffer();
     });
+    if (this._disposed) throw new Error('Device3D disposed');
     if (onProgress) onProgress('parsing model');
     const obj = loader.parse(buf);
 
@@ -232,6 +231,11 @@ export class Device3D {
       // normals, there is nothing for PBR to express: a pixel diff of the two
       // renders came out 90.7% identical, with 0.008% of pixels differing by
       // more than 24/255 (confined to specular highlight edges).
+      const materials = Array.isArray(n.material) ? n.material : [n.material];
+      for (const material of materials) {
+        for (const value of Object.values(material)) if (value?.isTexture) value.dispose();
+        material.dispose();
+      }
       n.material = new THREE.MeshPhongMaterial({
         color: 0x3c4149, shininess: 25, specular: 0x2a2f36,
         vertexColors: false,
@@ -464,69 +468,30 @@ export class Device3D {
     this.homeCam = this.camera.position.clone();
   }
 
-  // Pull the panel from the WASM heap if it changed since the last upload.
+  // The runtime adapter is reusable with React Three Fiber or another renderer.
   syncPanel() {
-    // Before the runtime is initialised the exported symbols exist but abort
-    // the module when called, so testing for the function is not enough --
-    // gate on the page's first-frame latch, which proves main() is running.
-    if (!window.__cpFirstFrame) return false;
-    const M = window.Module;
-    if (!M || !M._cp_fb_sync || !M._cp_fb_ptr) return false;
-
-    let counter;
-    try { counter = M._cp_fb_counter(); } catch (e) { return false; }
-    if (counter === this.lastFrame) return false;
-    this.lastFrame = counter;
-
-    // NOTE: deliberately orientation-blind. See _blit.
-    M._cp_fb_sync();
-    const ptr = M._cp_fb_ptr();
-    // HEAPU8.buffer is a SharedArrayBuffer in this pthreads build, and some
-    // browsers refuse a SAB-backed view as a texture source. Copy out. At
-    // 800x480 that is 1.5 MB (~0.2 ms) and only when the panel actually
-    // changed, which for e-ink is a handful of times a second.
-    const src = new Uint8Array(M.HEAPU8.buffer, ptr, this.fbW * this.fbH * 4);
-    this._blit(src);
-    this.tex.needsUpdate = true;
-    return true;
-  }
-
-  // Copy the physical panel into the texture.
-  //
-  // ORIENTATION: intentionally ignored. The framebuffer is always the panel's
-  // native 800x480 scanout, and the panel is physically mounted rotated behind
-  // portrait glass -- so buffer -> glass is a FIXED transform, no matter what
-  // the firmware's orientation setting is. Rotating here as well would be
-  // rotating twice.
-  //
-  // This is where the 2D and 3D views legitimately differ. presentIfNeeded()
-  // rotates the SDL *window* so a landscape book is upright on your monitor,
-  // which is a convenience: you cannot tilt a monitor. In 3D you can just orbit
-  // the model, and the whole point is to show the real device, so landscape
-  // content must appear sideways on portrait glass exactly as it does in your
-  // hands. cp_fb_orientation() is therefore not consulted by this path.
-  //
-  // The panel is greyscale (argbGray sets R==G==B), so the ARGB->RGBA byte
-  // order difference is invisible and channels copy straight across. That
-  // breaks if the panel ever goes colour.
-  _blit(src) {
-    const W = this.fbW, H = this.fbH;     // 800 x 480 source
-    const dst = this.texBuf;              // 480 x 800 destination
-    const dw = H;
-    // Content sits rotated 90 CCW in the buffer, so undo with 90 CW. Texture v
-    // runs bottom-up while image row 0 is the top; folding that flip in here
-    // rather than using tex.flipY keeps the raycast UV maths in _addScreen
-    // simple.
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        const s = (y * W + x) * 4;
-        const dx = H - 1 - y;
-        const dy = W - 1 - x;             // includes the vertical flip
-        const d = (dy * dw + dx) * 4;
-        dst[d] = src[s + 2]; dst[d + 1] = src[s + 1];
-        dst[d + 2] = src[s]; dst[d + 3] = 255;
+    const frame = this.framebuffer.read();
+    if (!frame) return false;
+    if (this.fbW !== frame.height || this.fbH !== frame.width) {
+      this.fbW = frame.height;
+      this.fbH = frame.width;
+      this.tex.dispose();
+      this._buildPanelTexture();
+      if (this.screen) {
+        this.screen.material.map = this.tex;
+        this.screen.material.needsUpdate = true;
+        const height = this.opts.panelW * this.fbW / this.fbH;
+        this.screen.position.y += (this.panelRect.h - height) / 2;
+        this.screen.geometry.dispose();
+        this.screen.geometry = new THREE.PlaneGeometry(this.opts.panelW, height);
+        this.panelRect.h = height;
       }
     }
+    this.texBuf = frame.pixels;
+    this.tex.image.data = frame.pixels;
+    this.tex.needsUpdate = true;
+    this.lastFrame = frame.frame;
+    return true;
   }
 
   resize() {
@@ -555,7 +520,7 @@ export class Device3D {
   }
 
   start() {
-    if (this._raf) return;
+    if (this._raf || this._disposed) return;
     const tick = () => {
       this._raf = requestAnimationFrame(tick);
       // Both of these are cheap and must run every frame regardless: syncPanel
@@ -579,5 +544,30 @@ export class Device3D {
   stop() {
     if (this._raf) cancelAnimationFrame(this._raf);
     this._raf = null;
+  }
+
+  // React effects and failed loads must release both CPU and GPU resources.
+  dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    this._abort.abort();
+    this.stop();
+    window.removeEventListener('resize', this._onResize);
+    this._ro?.disconnect();
+    this.controls.dispose();
+    const resources = new Set([this.tex]);
+    this.scene.traverse((node) => {
+      if (node.geometry) resources.add(node.geometry);
+      const materials = node.material ? (Array.isArray(node.material) ? node.material : [node.material]) : [];
+      for (const material of materials) {
+        resources.add(material);
+        for (const value of Object.values(material)) if (value?.isTexture) resources.add(value);
+      }
+    });
+    for (const resource of resources) resource.dispose();
+    this.renderer.dispose();
+    this.renderer.forceContextLoss();
+    this.renderer.domElement.remove();
+    this.ready = false;
   }
 }

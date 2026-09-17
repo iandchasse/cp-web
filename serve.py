@@ -51,11 +51,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
             self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
-        # Cache the immutable loose SD assets (mirrors the _headers rule) so
-        # reloads don't re-download the fonts/dictionary every time; keep
+        # Revalidate mutable loose SD assets (mirrors the _headers rule); keep
         # app/html/json uncached so rebuilds show up immediately.
         if "/fs/" in getattr(self, "path", ""):
-            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.send_header("Cache-Control", "public, max-age=0, must-revalidate")
         else:
             self.send_header("Cache-Control", "no-store")
         super().end_headers()

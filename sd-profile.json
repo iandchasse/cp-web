@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "description": "Public demo: three home-screen books, built-in fonts, no dictionary.",
+  "include": [
+    "books/pg1342-images-3.epub",
+    "books/pg1727-images-3.epub",
+    "books/pg1513-images-3.epub"
+  ]
+}

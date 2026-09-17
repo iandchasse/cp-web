@@ -24,7 +24,7 @@ jobs:
       deployable: ${{ steps.result.outputs.deployable }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Decide build mode
         id: mode
@@ -59,13 +59,26 @@ jobs:
           done
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.12'
 
+      - name: Set up Node
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Verify browser dependencies and regression tests
+        run: |
+          npm ci --ignore-scripts
+          npm run vendor:check
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py'
+
       - name: Cache emsdk
         id: cache-emsdk
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: emsdk
           key: emsdk-${{ runner.os }}-${{ env.EMSDK_VERSION }}
@@ -143,7 +156,7 @@ jobs:
           fi
 
       - name: Cache objects
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: obj
           key: obj-${{ env.EMSDK_VERSION }}-${{ env.FIRMWARE_REF }}-${{ env.SIMULATOR_REF }}-${{ hashFiles('build.py', 'patches/*.patch') }}
@@ -190,17 +203,19 @@ jobs:
           fi
 
       - name: Upload build
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: crosspoint-web
           path: dist
           retention-days: 7
+          include-hidden-files: true
 
       - name: Upload Pages artifact
         if: steps.result.outputs.deployable == 'true'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: dist
+          include-hidden-files: true
 
   deploy:
     needs: build
@@ -212,4 +227,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5.0.1

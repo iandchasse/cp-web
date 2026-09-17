@@ -1,0 +1,135 @@
+// Requires a local server and Chrome/Chromium. Isolated temporary profile;
+// always exits nonzero on regression and tears down the browser on failure.
+// CHROME=/path/to/chrome node qa/cdp_smoke.mjs http://127.0.0.1:8099/reader/
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve, dirname, basename } from 'node:path';
+import { spawn } from 'node:child_process';
+
+const profile = await mkdtemp(join(tmpdir(), 'cpweb-smoke-'));
+const chromePath = process.env.CHROME || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const port = 9357;
+const browser = spawn(chromePath, ['--headless=new', `--remote-debugging-port=${port}`,
+  `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check',
+  '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--window-size=1000,1100', 'about:blank'],
+{ stdio: 'ignore' });
+let launchError;
+browser.on('error', error => { launchError = error; });
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function until(fn, message, timeout = 90000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (launchError) throw launchError;
+    if (await fn()) return;
+    await sleep(250);
+  }
+  throw new Error('Timed out: ' + message);
+}
+let socket;
+try {
+  let target;
+  await until(async () => {
+    try { target = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t => t.type === 'page'); }
+    catch { return false; }
+    return !!target;
+  }, 'browser start', 15000);
+  socket = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
+  let id = 0;
+  const pending = new Map();
+  const exceptions = [];
+  socket.onmessage = event => {
+    const message = JSON.parse(event.data);
+    if (message.id) pending.get(message.id)?.(message);
+    if (message.method === 'Runtime.exceptionThrown') exceptions.push(message.params.exceptionDetails);
+  };
+  function send(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const request = ++id;
+      const timer = setTimeout(() => { pending.delete(request); reject(new Error('CDP timeout: ' + method)); }, 30000);
+      pending.set(request, message => {
+        clearTimeout(timer); pending.delete(request);
+        if (message.error) reject(new Error(JSON.stringify(message.error))); else resolve(message.result);
+      });
+      socket.send(JSON.stringify({ id: request, method, params }));
+    });
+  }
+  async function js(expression) {
+    const result = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+    if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+    return result.result.value;
+  }
+  await send('Runtime.enable');
+  await send('Page.enable');
+  for (const model of ['x4pro']) {
+    const url = new URL(process.argv[2] || 'http://127.0.0.1:8099/reader/');
+    url.searchParams.set('model', model);
+    await send('Page.navigate', { url: String(url) });
+    await until(() => js('!!window.__cpFirstFrame'), model + ' first frame');
+    assert.equal(await js('crossOriginIsolated'), true);
+    await until(() => js('!!window.fsLoad?.ready'), model + ' filesystem');
+    assert.equal(await js('window.fsLoad.error'), null);
+    if (process.env.CHECK_DEMO_CONTENT === '1') {
+      assert.deepEqual(await js('Module.FS.readdir("/fs_/books").filter(name => name.endsWith(".epub")).sort()'),
+        ['pg1342-images-3.epub', 'pg1513-images-3.epub', 'pg1727-images-3.epub']);
+      assert.equal(await js('Module.FS.analyzePath("/fs_/fonts").exists'), false);
+      assert.equal(await js('Module.FS.analyzePath("/fs_/dictionaries").exists'), false);
+      const settings = await js('JSON.parse(Module.FS.readFile("/fs_/.crosspoint/settings.json", { encoding: "utf8" }))');
+      assert.equal(settings.sdFontFamilyName || '', '');
+      assert.equal(settings.dictionaryName || '', '');
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+      await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+      await until(() => js(`(() => {
+        const path = '/fs_/.crosspoint/epub_1803226487/sections';
+        return Module.FS.analyzePath(path).exists && Module.FS.readdir(path).some(name => name.endsWith('.bin'));
+      })()`), 'book layout regenerated with built-in font');
+      console.log(`${model}: three-book profile, built-in font and first-book pagination passed`);
+    }
+    // Toggle on then off while the model is still loading.
+    await js('window.__enable3d(); document.getElementById("view3d").click()');
+    await until(() => js('!!window.__dev3d?.ready'), model + ' 3D load');
+    assert.equal(await js('window.__dev3d._raf'), null, 'hidden view restarted');
+    await js('window.__enable3d()');
+    await until(() => js('window.__dev3d?.lastFrame >= 0'), 'panel texture');
+    const dimensions = await js('[window.__dev3d.tex.image.width, window.__dev3d.tex.image.height]');
+    assert.deepEqual(dimensions, model === 'x3' ? [528, 792] : [480, 800]);
+    assert.ok(await js('window.__dev3d.tris > 0'));
+    // Drive a real physical-button press through the capture listeners.
+    const button = await js('window.__dev3d.buttonToClient("down")');
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...button, button: 'left', buttons: 1, clickCount: 1 });
+    await sleep(150);
+    assert.equal(await js('window.__dev3d.buttons.find(b => b.userData.button.id === "down").material.opacity'), 0.45);
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...button, button: 'left', buttons: 0, clickCount: 1 });
+    assert.equal(await js('window.__dev3d.buttons.find(b => b.userData.button.id === "down").material.opacity'), 0);
+    await js('window.__dev3d.dispose(); window.__dev3d.dispose()');
+    assert.equal(await js('document.querySelectorAll("#stage3d canvas").length'), 0);
+    assert.equal(await js('window.__dev3d._raf'), null);
+    assert.equal(await js(`(async () => {
+      const { Device3D } = await import('./three/cp3d.js');
+      const view = new Device3D(document.getElementById('stage3d'));
+      const result = view.load().then(() => false, () => true);
+      view.dispose();
+      return await result && !document.querySelector('#stage3d canvas');
+    })()`), true, 'dispose during fetch must abort and remove the canvas');
+    console.log(`${model}: boot, filesystem, 3D, dimensions, toggle race, button input and disposal passed`);
+  }
+  // A broken manifest must leave an actionable error and must not start main().
+  await send('Network.enable');
+  await send('Network.setBlockedURLs', { urls: ['*manifest.json'] });
+  const failureUrl = new URL(process.argv[2] || 'http://127.0.0.1:8099/reader/');
+  failureUrl.searchParams.set('model', 'x4pro');
+  await send('Page.navigate', { url: String(failureUrl) });
+  await until(() => js('!!window.fsLoad?.error'), 'filesystem failure');
+  assert.equal(await js('!!window.__cpFirstFrame'), false);
+  assert.match(await js('document.getElementById("status").textContent'), /Filesystem load failed/);
+  console.log('Manifest failure: startup blocked with a visible error');
+  assert.deepEqual(exceptions, [], 'uncaught browser exceptions');
+} finally {
+  socket?.close();
+  const exited = new Promise(resolve => browser.once('exit', resolve));
+  if (browser.exitCode === null && !launchError) { browser.kill(); await exited; }
+  assert.equal(dirname(resolve(profile)), resolve(tmpdir()));
+  assert.ok(basename(profile).startsWith('cpweb-smoke-'));
+  await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+}

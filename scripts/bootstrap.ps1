@@ -26,13 +26,17 @@ function Clone-At([string]$url, [string]$dir, [string]$ref, [switch]$Submodules)
   if (-not (Test-Path $dir)) {
     Write-Host "`n[bootstrap] cloning $dir"
     git clone --filter=blob:none $url $dir
+    if ($LASTEXITCODE -ne 0) { throw "clone failed: $dir" }
   }
   git -C $dir fetch --all --quiet
+  if ($LASTEXITCODE -ne 0) { throw "fetch failed: $dir" }
   git -C $dir checkout --detach $ref
+  if ($LASTEXITCODE -ne 0) { throw "checkout failed: $dir at $ref" }
   if ($Submodules) {
     # freeink-sdk (and its nested lucide-icons) supply headers the build needs;
     # without this the compile fails on missing FreeInkUI/Icons includes.
     git -C $dir submodule update --init --recursive --depth 1
+    if ($LASTEXITCODE -ne 0) { throw "submodule update failed: $dir" }
   }
 }
 
@@ -41,12 +45,16 @@ Clone-At $pins.SIMULATOR_REPO 'simulator' $pins.SIMULATOR_REF
 
 # Single-header amalgamation the firmware and the simulator's WString.h both
 # depend on. Fetched at the pinned version and checksum-verified.
-if (-not (Test-Path 'thirdparty/ArduinoJson.h')) {
+if (-not (Test-Path 'thirdparty/ArduinoJson.h') -or
+    (Get-FileHash 'thirdparty/ArduinoJson.h' -Algorithm SHA256).Hash.ToLower() -ne $pins.ARDUINOJSON_SHA256.ToLower()) {
   Write-Host "`n[bootstrap] fetching ArduinoJson $($pins.ARDUINOJSON_VERSION)"
   New-Item -ItemType Directory -Force -Path thirdparty | Out-Null
   $v = $pins.ARDUINOJSON_VERSION
   Invoke-WebRequest -Uri "https://github.com/bblanchon/ArduinoJson/releases/download/v$v/ArduinoJson-v$v.h" `
-                    -OutFile 'thirdparty/ArduinoJson.h'
+                    -OutFile 'thirdparty/ArduinoJson.h.download'
+  $downloadHash = (Get-FileHash 'thirdparty/ArduinoJson.h.download' -Algorithm SHA256).Hash.ToLower()
+  if ($downloadHash -ne $pins.ARDUINOJSON_SHA256.ToLower()) { throw 'ArduinoJson download checksum mismatch' }
+  Move-Item -LiteralPath 'thirdparty/ArduinoJson.h.download' -Destination 'thirdparty/ArduinoJson.h' -Force
 }
 $got = (Get-FileHash 'thirdparty/ArduinoJson.h' -Algorithm SHA256).Hash.ToLower()
 if ($got -ne $pins.ARDUINOJSON_SHA256.ToLower()) {
@@ -88,12 +96,14 @@ if (-not (Test-Path 'emsdk')) {
   Write-Host "`n[bootstrap] installing emsdk $($pins.EMSDK_VERSION)"
   git clone --depth 1 https://github.com/emscripten-core/emsdk.git
   if ($LASTEXITCODE -ne 0) { throw "emsdk clone failed" }
-  # PowerShell resolves the extensionless name to emsdk.ps1 via PATHEXT.
-  ./emsdk/emsdk install  $pins.EMSDK_VERSION
-  if ($LASTEXITCODE -ne 0) { throw "emsdk install failed for $($pins.EMSDK_VERSION)" }
-  ./emsdk/emsdk activate $pins.EMSDK_VERSION
-  if ($LASTEXITCODE -ne 0) { throw "emsdk activate failed for $($pins.EMSDK_VERSION)" }
 }
+# Refresh version metadata and activate the pin even on an existing installation.
+git -C emsdk pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'emsdk metadata update failed' }
+./emsdk/emsdk install $pins.EMSDK_VERSION
+if ($LASTEXITCODE -ne 0) { throw "emsdk install failed for $($pins.EMSDK_VERSION)" }
+./emsdk/emsdk activate $pins.EMSDK_VERSION
+if ($LASTEXITCODE -ne 0) { throw "emsdk activate failed for $($pins.EMSDK_VERSION)" }
 
 # PlatformIO normally runs these as pre: extra_scripts. build.py does not, so
 # they must run here or the compile fails on missing i18n symbols.
