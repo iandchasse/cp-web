@@ -528,7 +528,8 @@
         const model = window.__cpModel;
         const calibration = {};
         const params = new URLSearchParams(location.search);
-        for (const key of ['panelW', 'topGap', 'zLift']) {
+        // Geometry calibration plus the look: ?einkWhite=236&einkBlack=34&glow=1.8&exposure=1.15
+        for (const key of ['panelW', 'topGap', 'zLift', 'einkWhite', 'einkBlack', 'glow', 'exposure']) {
           const value = parseFloat(params.get(key));
           if (Number.isFinite(value)) calibration[key] = value;
         }

@@ -77,9 +77,10 @@ const DEFAULTS = {
   // ink and paper are diffuse surfaces under the scene's lights, and only the
   // firmware's frontlight adds glow. These are the reflectances (sRGB) the
   // framebuffer's pure white and black map to, and how strong 100% light is.
-  einkWhite: 222,
-  einkBlack: 52,
-  glow: 2.2,      // emissive at 100%: well past paper white, so a lit panel reads as lit
+  einkWhite: 236,
+  einkBlack: 34,
+  glow: 1.8,      // emissive at 100%: well past paper white, so a lit panel reads as lit
+  exposure: 1.15, // overall scene brightness; e-paper in a bright room, not overcast
   shadows: true,
 };
 
@@ -116,10 +117,12 @@ export class Device3D {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.renderer.setSize(w, h, false);
-    // Filmic tone mapping so a lit frontlight can go brighter than paper white
-    // without clipping to a flat block, and soft shadows for the ground contact.
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.0;
+    // Tone mapping so a lit frontlight can go brighter than paper white without
+    // clipping to a flat block. Neutral (Khronos PBR) rather than ACES: ACES
+    // desaturates and rolls off the mid-tones, which read as a muted, overcast
+    // scene; Neutral keeps paper white white and only compresses the top end.
+    this.renderer.toneMapping = THREE.NeutralToneMapping;
+    this.renderer.toneMappingExposure = this.opts.exposure;
     if (this.opts.shadows) {
       this.renderer.shadowMap.enabled = true;
       this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -141,9 +144,9 @@ export class Device3D {
     this.envMap = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
     this.scene.environment = this.envMap;
-    this.scene.environmentIntensity = 0.75;
+    this.scene.environmentIntensity = 1.15;
 
-    const key = new THREE.DirectionalLight(0xfff4e8, 1.6);
+    const key = new THREE.DirectionalLight(0xffffff, 2.4);
     key.position.set(-120, 220, 240);
     if (this.opts.shadows) {
       key.castShadow = true;
@@ -154,7 +157,7 @@ export class Device3D {
     }
     this.scene.add(key);
     this.keyLight = key;
-    const fill = new THREE.DirectionalLight(0xdce6f5, 0.35);
+    const fill = new THREE.DirectionalLight(0xe8eef8, 0.5);
     fill.position.set(220, -40, 140);
     this.scene.add(fill);
 
@@ -270,7 +273,7 @@ export class Device3D {
         material.dispose();
       }
       n.material = new THREE.MeshStandardMaterial({
-        color: 0x363b43, roughness: 0.55, metalness: 0.05, envMapIntensity: 1.0,
+        color: 0x363b43, roughness: 0.45, metalness: 0.05, envMapIntensity: 1.0,
         vertexColors: false,
       });
       n.castShadow = n.receiveShadow = !!this.opts.shadows;
@@ -325,7 +328,7 @@ export class Device3D {
     const screen = new THREE.Mesh(
       new THREE.PlaneGeometry(panelW, panelH),
       new THREE.MeshStandardMaterial({
-        map: this.tex, roughness: 0.92, metalness: 0, envMapIntensity: 0.6,
+        map: this.tex, roughness: 0.85, metalness: 0, envMapIntensity: 0.8,
         emissiveMap: this.tex, emissive: 0x000000, emissiveIntensity: 0,
       })
     );
@@ -337,10 +340,11 @@ export class Device3D {
     this.panelRect = { w: panelW, h: panelH, cx, cy, sideGap, topGap };
 
     // Light leaking past the glass edge onto the bezel when the frontlight is
-    // on: a soft additive halo just behind the panel plane, so only the ring
-    // around it shows. Invisible until the light comes on.
+    // on: a faint additive halo just behind the panel plane, so only a thin
+    // ring around it shows. The real light guides contain their light well,
+    // so this is barely there. Invisible until the light comes on.
     const halo = new THREE.Mesh(
-      new THREE.PlaneGeometry(panelW * 1.3, panelH * 1.2),
+      new THREE.PlaneGeometry(panelW * 1.08, panelH * 1.05),
       new THREE.MeshBasicMaterial({
         map: this._haloTexture(), color: 0xffffff, transparent: true, opacity: 0,
         blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
@@ -389,7 +393,7 @@ export class Device3D {
     }
     if (this.halo) {
       this.halo.material.color.setRGB(color[0], color[1], color[2], THREE.LinearSRGBColorSpace);
-      this.halo.material.opacity = Math.min(0.55, intensity * 0.25);
+      this.halo.material.opacity = Math.min(0.12, intensity * 0.06);
       this.halo.visible = intensity > 0;
     }
     this._dirty = true;

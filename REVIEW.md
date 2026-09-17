@@ -144,10 +144,14 @@ Measured with a fresh Chrome profile against the deployed site, CDP-throttled to
 The panel used to be an unlit `MeshBasicMaterial` showing the framebuffer at
 full white: a backlit LCD. E-paper is reflective, so it is now a fully rough
 standard material lit by the scene, whose map is the framebuffer remapped
-through `einkLut()` to e-paper reflectances (white ≈ 222, black ≈ 52 in sRGB).
+through `einkLut()` to e-paper reflectances (white ≈ 236, black ≈ 34 in sRGB).
 The scene gets image-based lighting from three.js's `RoomEnvironment`, a key
-light with a soft shadow onto a shadow-catcher plane, ACES tone mapping, and a
-PBR case material in place of the earlier Phong.
+light with a soft shadow onto a shadow-catcher plane, Neutral (Khronos PBR)
+tone mapping, and a PBR case material in place of the earlier Phong. ACES was
+tried first and rejected: its mid-tone roll-off and desaturation read as an
+overcast day. The bezel halo is deliberately faint; the light guides on these
+panels contain their light well. `?einkWhite=&einkBlack=&glow=&exposure=` on
+the page URL override the look for tuning.
 
 The firmware's frontlight is the only emissive term. `HalFrontlight` in the
 simulator already tracks on/brightness/warmth without touching the framebuffer,
