@@ -2,11 +2,23 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFrontlight, frontlightEmissive, einkLut, applyLut } from '../runtime/frontlight.js';
 
+const OFF = { present: false, on: false, brightness: 0, warmth: 0 };
+
 test('frontlight reads the simulator exports and is off for builds without them', () => {
-  assert.deepEqual(readFrontlight({}), { present: false, on: false, brightness: 0, warmth: 0 });
+  assert.deepEqual(readFrontlight({}, () => true), OFF);
   const module = { _cp_frontlight_present: () => 1, _cp_frontlight_on: () => 1,
     _cp_frontlight_brightness: () => 60, _cp_frontlight_warmth: () => 50 };
-  assert.deepEqual(readFrontlight(module), { present: true, on: true, brightness: 60, warmth: 50 });
+  assert.deepEqual(readFrontlight(module, () => true), { present: true, on: true, brightness: 60, warmth: 50 });
+});
+
+test('frontlight never calls an export before the runtime is ready', () => {
+  // Emscripten installs abort-on-call stubs until initialization finishes, so
+  // a defined export is not a callable one. Reading one aborts the runtime.
+  const abort = () => { throw new Error('native function called before runtime initialization'); };
+  const stubs = { _cp_frontlight_present: abort, _cp_frontlight_on: abort,
+    _cp_frontlight_brightness: abort, _cp_frontlight_warmth: abort };
+  assert.deepEqual(readFrontlight(stubs, () => false), OFF);
+  assert.deepEqual(readFrontlight(stubs), OFF, 'no readiness check given: assume not ready');
 });
 
 test('frontlight emissive is dark when off, tinted by warmth, and monotonic in brightness', () => {

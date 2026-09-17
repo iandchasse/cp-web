@@ -13,8 +13,12 @@ export interface FrontlightEmissive {
   intensity: number;
 }
 
-/** Read the frontlight from the simulator's exports; off when a build lacks them. */
-export function readFrontlight(module: unknown): FrontlightState;
+/** Read the frontlight from the simulator's exports; off until `isReady()` is true.
+ *
+ * `isReady` must be the firmware's real first-frame latch: calling an export
+ * before the runtime initializes aborts it. Omitting it reports the light off.
+ */
+export function readFrontlight(module: unknown, isReady?: () => boolean): FrontlightState;
 
 /** Emissive colour and strength for a lit panel material; intensity is 0 when off. */
 export function frontlightEmissive(state: Pick<FrontlightState, 'on' | 'brightness' | 'warmth'>, glow?: number): FrontlightEmissive;

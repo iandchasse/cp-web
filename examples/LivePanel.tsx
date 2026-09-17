@@ -47,7 +47,9 @@ export function LivePanel({ getModule, isReady, width = 0.0591, height = 0.0985,
       texture.current.image.data = applyLut(frame.pixels, lut);
       texture.current.needsUpdate = true;
     }
-    const state = readFrontlight(getModule());
+    // Gated on the same readiness latch as the framebuffer: the frontlight
+    // exports abort the runtime if called before it has initialized.
+    const state = readFrontlight(getModule(), isReady);
     const last = light.current;
     if (state.on !== last.on || state.brightness !== last.brightness || state.warmth !== last.warmth) {
       light.current = { on: state.on, brightness: state.brightness, warmth: state.warmth };

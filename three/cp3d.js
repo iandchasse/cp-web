@@ -101,9 +101,13 @@ export class Device3D {
       opts.getModule || (() => window.Module),
       opts.isReady || (() => !!window.__cpFirstFrame),
     );
-    // Frontlight state comes from the firmware too. Injectable for hosts that
-    // do not use window.Module, like the framebuffer above.
-    this.getFrontlight = opts.getFrontlight || (() => readFrontlight(window.Module));
+    // Frontlight state comes from the firmware too, behind the same readiness
+    // latch: its exports are abort-on-call stubs until the runtime is up, and
+    // the 3D view can be opened while the firmware is still booting.
+    // Injectable for hosts that do not use window.Module, like the reader above.
+    const isReady = opts.isReady || (() => !!window.__cpFirstFrame);
+    this.getFrontlight = opts.getFrontlight ||
+      (() => readFrontlight(opts.getModule ? opts.getModule() : window.Module, isReady));
     this.lut = einkLut(this.opts.einkWhite, this.opts.einkBlack);
     this.frontlight = { on: false, brightness: 0, warmth: 0 };
     this._abort = new AbortController();

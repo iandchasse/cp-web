@@ -154,6 +154,24 @@ try {
     })()`), true, 'dispose during fetch must abort and remove the canvas');
     console.log(`${model}: boot, filesystem, 3D, dimensions, toggle race, button input and disposal passed`);
   }
+  // Opening the 3D view while the firmware is still booting must not touch its
+  // exports: before the runtime initializes they are stubs that abort it. The
+  // view has to come up lit-off and pick the frontlight up once the panel does.
+  {
+    const bootUrl = new URL(process.argv[2] || 'http://127.0.0.1:8099/reader/');
+    bootUrl.searchParams.set('model', 'x4pro');
+    await send('Page.navigate', { url: String(bootUrl) });
+    await until(() => js('typeof window.__enable3d === "function"'), '3D entry point');
+    assert.equal(await js('!!window.__cpFirstFrame'), false, 'firmware must still be booting');
+    await js('window.__enable3d()');
+    await until(() => js('!!window.__dev3d?.ready'), '3D loads during boot');
+    assert.equal(await js('window.__dev3d.screen.material.emissiveIntensity'), 0, 'unlit before the first frame');
+    await until(() => js('!!window.__cpFirstFrame'), 'firmware first frame with 3D already open');
+    await until(() => js('window.__dev3d.lastFrame >= 0'), 'panel texture after boot');
+    assert.equal(await js('window.fsLoad.error'), null);
+    console.log('3D opened during boot: no aborted runtime, panel live once booted');
+  }
+
   // A broken manifest must leave an actionable error and must not start main().
   await send('Network.enable');
   await send('Network.setBlockedURLs', { urls: ['*manifest.json'] });

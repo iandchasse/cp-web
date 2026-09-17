@@ -159,6 +159,13 @@ overcast day. The bezel halo is deliberately faint; the light guides on these
 panels contain their light well. `?einkWhite=&einkBlack=&glow=&exposure=` on
 the page URL override the look for tuning.
 
+Pressing the 3D button while the firmware was still booting aborted the whole
+runtime: the frontlight reader checked that `_cp_frontlight_present` existed,
+but before initialization Emscripten installs stubs that abort when called, so
+a defined export is not a callable one. `readFrontlight` now takes the same
+first-frame latch `FramebufferReader` uses and reports the light off until then;
+the smoke suite opens the 3D view mid-boot to hold that.
+
 The firmware's frontlight is the only emissive term. `HalFrontlight` in the
 simulator already tracks on/brightness/warmth without touching the framebuffer,
 exactly like the hardware; the patch exports it (`cp_frontlight_*`) and

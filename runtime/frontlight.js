@@ -7,9 +7,18 @@
  * diffuse look (paper grey, ink black) is separate, see einkLut().
  */
 
-/** Read the frontlight from the simulator exports; off when a build lacks them. */
-export function readFrontlight(module) {
-  if (!module?._cp_frontlight_on) return { present: false, on: false, brightness: 0, warmth: 0 };
+const OFF = { present: false, on: false, brightness: 0, warmth: 0 };
+
+/** Read the frontlight from the simulator exports; off until the runtime is up.
+ *
+ * `isReady` must be the firmware's real first-frame latch, not a timeout and
+ * not a check that the export exists: before initialization Emscripten installs
+ * stubs that ABORT the whole runtime when called, so "is the function defined?"
+ * is not a safe test. Same rule as FramebufferReader. Builds without the
+ * exports (an older WASM bundle) report the light off rather than throwing.
+ */
+export function readFrontlight(module, isReady = () => false) {
+  if (!isReady() || !module?._cp_frontlight_on) return OFF;
   return {
     present: !!module._cp_frontlight_present(),
     on: !!module._cp_frontlight_on(),
