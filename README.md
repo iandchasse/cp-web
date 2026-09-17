@@ -4,9 +4,15 @@ The CrossPoint e-reader firmware compiled to WebAssembly and running in a
 browser, with an optional three.js view that projects the live e-ink panel onto
 a model of the Xteink X4.
 
-Only the **X4 Pro** is built and deployed. The X4 and X3 profiles are stashed:
-they remain in `MODELS` in `build.py`, and adding an id back to `ENABLED_MODELS`
-restores it (the page's device picker reappears once more than one is built).
+Two firmwares are built, both for the **X4 Pro**, and the page's picker switches
+between them: **CrossPoint** (1.6.5rc) and **CrossInk** (v1.5.1, a fork of
+CrossPoint 1.5). Each is a separate upstream project with its own simulator HAL
+and its own web patch; they share this harness, the page, the 3D view and the SD
+tree, and both keep their state in `/.crosspoint`, so your place in a book
+carries across when you switch. See `VARIANTS` in `build.py`.
+
+The X4 and X3 device profiles are stashed: they remain in `MODELS`, and adding an
+id back to `ENABLED_MODELS` restores them.
 
 The build is **host-agnostic**. Every URL it emits is relative, and it falls
 back to a service worker when a host cannot set COOP/COEP — so the same `dist/`
@@ -26,15 +32,15 @@ compression, of which only 9.2 MiB is fetched before the reader starts.
 
 | Path | What it is |
 | --- | --- |
-| `build.py` | The whole build. Direct `emcc` compilation and `em++` linking — no PlatformIO. |
+| `build.py` | The whole build. Direct `emcc` compilation and `em++` linking — no PlatformIO. `VARIANTS` defines the firmwares. |
 | `switcher.html` | The page: model picker, 2D/3D toggle, boot loader, input routing. |
 | `three/` | Vendored three.js, `cp3d.js` (the 3D view), and `x4-device.3mf`. |
 | `runtime/frontlight.js` | Maps the firmware's frontlight to an emissive term; e-paper reflectance LUT. |
 | `shims/` | Host shims the firmware links against, incl. the sleep/wake reload. |
 | `seed.json` | Source first-visit state; curated at build time against the shipped library. |
 | `sd-profile.json` | Optional `--slim` allowlist: books only, no SD fonts or dictionary. |
-| `patches/` | Simulator changes not yet upstream (see below). |
-| `pins.env` | Firmware, simulator, Emscripten and ArduinoJson pins. |
+| `patches/` | One web patch per simulator, not yet upstream (see below). |
+| `pins.env` | Per-variant firmware/simulator pins, plus Emscripten and ArduinoJson. |
 | `package.json`, `package-lock.json` | Pinned browser vendor tooling and libraries. |
 | `runtime/` | Framework-independent framebuffer, frontlight and filesystem adapters, with TypeScript declarations. |
 | `examples/LivePanel.tsx` | Reuse the live panel in Silkscreen's React Three Fiber scene. |
@@ -45,7 +51,8 @@ compression, of which only 9.2 MiB is fetched before the reader starts.
 ## What is deliberately *not* here
 
 - **`emsdk/`** (~2 GB) — reinstalled from `EMSDK_VERSION` in `pins.env`.
-- **`firmware/`, `simulator/`** — upstream repos, cloned at the pinned SHAs.
+- **`firmware/`, `simulator/`, `firmware-crossink/`, `simulator-crossink/`** —
+  upstream repos, cloned at the pinned SHAs.
   `bootstrap.ps1` and CI both clone them *inside* this repo (they are
   gitignored); `build.py` also accepts them as siblings, which is how the
   original local workspace was laid out.
@@ -69,7 +76,8 @@ python serve.py
 Then open <http://127.0.0.1:8000/>.
 
 Day to day: `python build.py page` for HTML/JS changes (seconds),
-`python build.py model x4pro` for the model only, `all` for everything.
+`python build.py model crossink` for one firmware, `all` for everything.
+Bundles land as `dist/<firmware>-<device>.js`, e.g. `dist/crossink-x4pro.js`.
 
 ### SD content
 
@@ -182,6 +190,35 @@ That serves with **no** COOP/COEP headers from a **subpath**, i.e. the GitHub
 Pages project-site case. Confirmed good: `crossOriginIsolated: true`,
 `SharedArrayBuffer` available, service worker in control, 2D and 3D both
 interactive.
+
+## Firmware variants
+
+`VARIANTS` in `build.py` is the whole definition of a firmware: where its
+checkouts live, which patch its simulator needs, its version macro, its extra
+defines, the SDK libraries it pulls, and the sources to skip. Adding a third
+fork means adding an entry, a patch and its pins.
+
+Everything in the table was found by building the two:
+
+| | CrossPoint | CrossInk |
+| --- | --- | --- |
+| Checkouts | `firmware/`, `simulator/` | `firmware-crossink/`, `simulator-crossink/` |
+| Version macro | `CROSSPOINT_VERSION` | `CROSSINK_VERSION` |
+| SDK pin | its own submodule commit | a different one (it uses `pageRowsFor`) |
+| Extra SDK libs | — | `NearbyTransfer` |
+| Native decoders | — | not enabled: the simulator's decoder shim is used, as here |
+| `firmware_link_stubs.cpp` | **needed** (upstream dropped its `MySerialImpl`/uzlib definitions) | **excluded** (still defines both itself) |
+| Also skipped | — | `HalClockSim`, `SimulatorSmokeTest.cpp` |
+| Extra shim | — | `shims/crossink/smoke_test_stub.cpp` |
+
+That stubs row is the trap: the two firmwares need *opposite* treatment of the
+same simulator file, which is why exclusions are per variant rather than global.
+Files under `shims/<variant>/` compile only into that variant.
+
+The quick panel differs too: both open the frontlight drawer on a top-edge
+down-swipe, but only CrossPoint toggles the light with Enter, so the smoke
+suite drives the full firmware-to-3D path there and asserts the state mapping
+directly on both.
 
 ## The simulator patch
 

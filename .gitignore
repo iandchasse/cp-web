@@ -12,6 +12,8 @@ fs_/
 # Upstream clones, pinned in pins.env and fetched by scripts/bootstrap.ps1
 firmware/
 simulator/
+firmware-crossink/
+simulator-crossink/
 emsdk/
 thirdparty/
 

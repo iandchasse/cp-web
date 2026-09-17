@@ -176,6 +176,33 @@ halo behind the glass leaks onto the bezel. The quick panel (status-bar tap,
 Enter toggles, Left/Right adjust) drives it live. `examples/LivePanel.tsx`
 carries the same treatment for Silkscreen.
 
+## Two firmwares — 2026-09-17
+
+The page now offers CrossPoint 1.6.5rc and CrossInk v1.5.1, both X4 Pro, built
+from the same harness against their own upstream pairs. Both were proven by
+building before any of the wiring was written.
+
+- **CrossPoint moved from 1.6.0rc-56 to 1.6.5rc.** The web patch applied to the
+  simulator's HEAD unchanged, but three firmware HAL members had no simulator
+  counterpart: `HalFile::modificationTime` (the library index validates its
+  cache with it), `HalDisplay::GrayscaleMode::Direct` and
+  `HalStorage::usbDriveHostSuspended`. The patch now carries all three as
+  catch-up shims — `Direct` is declared but reported unsupported, so the
+  firmware falls back to `Absolute`, which is what this display does anyway.
+  Delete each when upstream grows its own.
+- **CrossInk needed its own patch**, ported edit for edit from CrossPoint's: the
+  `cp_fb_*` exports with their frame counter and mutex, the cooperative web
+  sleep, the `delay()` deadline and the `cp_frontlight_*` exports. Its
+  `startDeepSleep` was identical to CrossPoint's pre-patch version.
+- **The build rules that differ are per variant, not global.** The sharpest case
+  is `firmware_link_stubs.cpp`: CrossPoint needs it because upstream dropped its
+  `MySerialImpl` and uzlib definitions, while CrossInk still defines both and
+  would link them twice. A test asserts the two lists stay opposed.
+- **Objects now link through a response file.** Two variants' mangled object
+  names exceed the 32k Windows command-line limit (WinError 206).
+- CrossInk's WASM is 6.69 MB against CrossPoint's 5.68 MB; only the selected
+  build is fetched, so a visit still downloads one runtime.
+
 ## Validation
 
 - Fresh bootstrap with checksum-verified ArduinoJson and Emscripten 6.0.9.

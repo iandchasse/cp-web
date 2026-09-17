@@ -80,8 +80,8 @@ class BuildTests(unittest.TestCase):
 
     def test_link_ignores_orphaned_objects(self):
         with tempfile.TemporaryDirectory() as folder:
-            objdir = pathlib.Path(folder) / 'x4'
-            objdir.mkdir()
+            objdir = pathlib.Path(folder) / 'crosspoint' / 'x4pro'
+            objdir.mkdir(parents=True)
             (objdir / 'removed.o').write_bytes(b'old')
             current = objdir / 'current.o'
             current.write_bytes(b'new')
@@ -90,10 +90,39 @@ class BuildTests(unittest.TestCase):
                     patch.object(build, 'obj_path', return_value=str(current)), \
                     patch.object(build.subprocess, 'run') as run:
                 run.return_value.returncode = 0
-                self.assertEqual(build.link_model('x4'), 0)
+                self.assertEqual(build.link_model('crosspoint', 'x4pro'), 0)
                 command = run.call_args.args[0]
-                self.assertIn(str(current), command)
-                self.assertNotIn(str(objdir / 'removed.o'), command)
+                # Objects go in a response file (Windows command-line limit),
+                # so the orphan must be absent from that, not from argv.
+                listed = (objdir / 'link.rsp').read_text()
+                self.assertIn(str(current).replace('\\', '/'), listed)
+                self.assertNotIn('removed.o', listed)
+                self.assertIn(str(pathlib.Path(folder) / 'crosspoint-x4pro.js'), command)
+
+    def test_variants_get_their_own_paths_defines_and_shims(self):
+        for variant, spec in build.VARIANTS.items():
+            build.use_variant(variant)
+            self.assertTrue(build.FW.endswith(spec['firmware']), build.FW)
+            self.assertTrue(build.SIM.endswith(spec['simulator']), build.SIM)
+            defines = build.variant_defines(variant, 'x4pro')
+            self.assertTrue(any(d.startswith('-D' + spec['version'] + '=') for d in defines),
+                            'missing version macro for ' + variant)
+            # Another variant's shims must never be compiled into this one.
+            shims = [src for src in build.collect_sources()
+                     if build.norm(build.SHIMS) in build.norm(src)]
+            for other in build.VARIANTS:
+                if other == variant:
+                    continue
+                self.assertFalse(any('/%s/' % other in build.norm(src) for src in shims),
+                                 '%s compiled %s shims' % (variant, other))
+        build.use_variant(build.ENABLED_VARIANTS[0])
+
+    def test_crossink_and_crosspoint_disagree_about_the_simulator_stubs(self):
+        # CrossPoint needs firmware_link_stubs.cpp (upstream dropped its
+        # MySerialImpl/uzlib definitions); CrossInk still defines both itself
+        # and would link them twice. A regression here is a duplicate symbol.
+        self.assertNotIn('firmware_link_stubs.cpp', build.VARIANTS['crosspoint']['exclude'])
+        self.assertIn('firmware_link_stubs.cpp', build.VARIANTS['crossink']['exclude'])
 
 
 if __name__ == '__main__':

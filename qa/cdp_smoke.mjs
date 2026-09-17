@@ -62,8 +62,14 @@ try {
   }
   await send('Runtime.enable');
   await send('Page.enable');
-  for (const model of ['x4pro']) {
-    const url = new URL(process.argv[2] || 'http://127.0.0.1:8099/reader/');
+  // Every build the page advertises: one entry per firmware variant.
+  const base = new URL(process.argv[2] || 'http://127.0.0.1:8099/reader/');
+  const builds = await (await fetch(new URL('models.json', base))).json();
+  assert.ok(builds.length, 'models.json lists no builds');
+  console.log('builds: ' + builds.map(b => b.label).join(', '));
+  for (const build of builds) {
+    const model = build.id;
+    const url = new URL(base);
     url.searchParams.set('model', model);
     await send('Page.navigate', { url: String(url) });
     await until(() => js('!!window.__cpFirstFrame'), model + ' first frame');
@@ -113,28 +119,58 @@ try {
     await js('window.__enable3d()');
     await until(() => js('window.__dev3d?.lastFrame >= 0'), 'panel texture');
     const dimensions = await js('[window.__dev3d.tex.image.width, window.__dev3d.tex.image.height]');
-    assert.deepEqual(dimensions, model === 'x3' ? [528, 792] : [480, 800]);
+    assert.deepEqual(dimensions, [build.w, build.h]);
     assert.ok(await js('window.__dev3d.tris > 0'));
-    // The panel is lit e-paper, dark until the firmware's own frontlight comes
-    // on: open the quick panel with a status-bar tap in 2D, toggle it with
-    // Enter, and the 3D material must follow the exported state.
+    // The panel is lit e-paper, dark until the firmware's frontlight comes on.
     assert.equal(await js('window.__dev3d.screen.material.emissiveIntensity'), 0, 'frontlight off at boot');
-    await js('document.getElementById("view3d").click()');
-    await sleep(800);
-    const bar = await js('(() => { const r = document.getElementById("canvas").getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + 12 }; })()');
-    await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...bar, button: 'left', buttons: 1, clickCount: 1 });
-    await sleep(80);
-    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...bar, button: 'left', buttons: 0, clickCount: 1 });
-    await sleep(2000);
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await until(() => js('Module._cp_frontlight_on() === 1'), 'firmware frontlight on', 10000);
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-    await sleep(500);
-    await js('document.getElementById("view3d").click()');
-    await until(() => js('window.__dev3d.screen.material.emissiveIntensity > 0'), 'panel emissive follows the frontlight', 10000);
+    assert.equal(await js('typeof Module._cp_frontlight_on'), 'function', 'frontlight exports missing');
+    assert.equal(await js('Module._cp_frontlight_on()'), 0, 'firmware starts with the light off');
+    // The 3D material must follow that state, not a timer or a guess. Keep the
+    // real reader so the end-to-end check below still sees the firmware.
+    await js(`window.__realFrontlight = window.__dev3d.getFrontlight`);
+    await js(`window.__dev3d.getFrontlight = () => ({ on: true, brightness: 80, warmth: 20 })`);
+    await until(() => js('window.__dev3d.screen.material.emissiveIntensity > 0'),
+                'panel emissive follows the frontlight', 10000);
     assert.equal(await js('window.__dev3d.halo.visible'), true);
+    await js(`window.__dev3d.getFrontlight = () => ({ on: false, brightness: 0, warmth: 0 })`);
+    await until(() => js('window.__dev3d.screen.material.emissiveIntensity === 0'),
+                'panel goes dark again', 10000);
+    await js(`window.__dev3d.getFrontlight = window.__realFrontlight`);
+
+    // End to end through the firmware's own UI. The quick panel opens on a
+    // top-edge down-swipe in both, but only CrossPoint toggles the light with
+    // Enter -- CrossInk's drawer has its own lamp control -- so drive the whole
+    // path only where a keypress is the documented toggle.
+    if (build.firmware === 'CrossPoint') {
+      await js('document.getElementById("view3d").click()');
+      await sleep(800);
+      // The quick panel opens from Home, FileBrowser or Settings, never from
+      // the reader, and the content check above leaves a book open.
+      for (let back = 0; back < 3; back++) {
+        await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+        await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+        await sleep(700);
+      }
+      const panel = await js('(() => { const r = document.getElementById("canvas").getBoundingClientRect(); return { x: r.left + r.width / 2, top: r.top, h: r.height }; })()');
+      const from = panel.top + 8;
+      const to = panel.top + Math.round(panel.h * 0.35);
+      await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: panel.x, y: from, button: 'left', buttons: 1, clickCount: 1 });
+      for (let step = 1; step <= 6; step++) {
+        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: panel.x,
+          y: from + Math.round((to - from) * step / 6), button: 'left', buttons: 1 });
+        await sleep(30);
+      }
+      await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: panel.x, y: to, button: 'left', buttons: 0, clickCount: 1 });
+      await sleep(2000);
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+      await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+      await until(() => js('Module._cp_frontlight_on() === 1'), 'firmware frontlight on', 10000);
+      await js('document.getElementById("view3d").click()');
+      await until(() => js('!!window.__dev3d?.ready'), '3D back after the quick panel');
+      await until(() => js('window.__dev3d.screen.material.emissiveIntensity > 0'),
+                  'panel lit from the firmware itself', 10000);
+      console.log(`${model}: quick panel lit the 3D panel end to end`);
+    }
     // Drive a real physical-button press through the capture listeners.
     const button = await js('window.__dev3d.buttonToClient("down")');
     await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...button, button: 'left', buttons: 1, clickCount: 1 });

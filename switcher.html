@@ -159,7 +159,7 @@
     <b>CrossPoint Reader — running in your browser</b><br />
     <span>The actual e-reader firmware, compiled to WebAssembly &middot; portrait <span id="dims">&mdash;</span> &middot; read-only library &middot; networking off</span>
     <div class="controls">
-      <label for="modelSel">Device</label>
+      <label for="modelSel">Firmware</label>
       <select id="modelSel"><option>loading&hellip;</option></select>
       <button id="view3d" type="button" aria-pressed="false" title="Project the live panel onto the device model">3D view</button>
       <span id="note"></span>
@@ -415,20 +415,24 @@
       var sel = document.getElementById('modelSel');
       sel.innerHTML = models.map(function (m) {
         return '<option value="' + m.id + '"' + (m.id === current.id ? ' selected' : '') +
-               '>' + m.label + (m.touch ? ' (touch)' : '') + '</option>';
+               '>' + m.label + '</option>';
       }).join('');
       sel.onchange = function () {
         var p = new URLSearchParams(location.search);
         p.set('model', sel.value);
-        location.search = p.toString(); // reload with the chosen model
+        location.search = p.toString(); // reload with the chosen build
       };
-      // Nothing to choose between with a single model; keep the 3D toggle.
+      // Nothing to choose between with a single build; keep the 3D toggle.
       var single = models.length < 2;
       sel.hidden = single;
       document.querySelector('label[for="modelSel"]').hidden = single;
-      document.getElementById('note').textContent = current.note || '';
+      // The picker now names the firmware, so the note carries the device.
+      document.getElementById('note').textContent =
+        (current.device ? current.device + ' · ' : '') + (current.note || '');
       document.getElementById('dims').textContent = current.w + '\u00d7' + current.h;
-      document.title = 'CrossPoint Reader — ' + current.label;
+      document.title = (current.firmware || 'CrossPoint') + ' Reader' +
+        (current.version ? ' ' + current.version : '') +
+        (current.device ? ' — ' + current.device : '');
     }
 
     // Load the model list, wire the UI, then inject the selected WASM bundle.
@@ -466,7 +470,7 @@
         s.async = true;
         s.onerror = function () {
           statusEl.textContent = 'Failed to load ' + s.src +
-            ' — run: python build.py model ' + model.id;
+            ' — run: python build.py model ' + model.id.split('-')[0];
         };
         document.body.appendChild(s);
       })

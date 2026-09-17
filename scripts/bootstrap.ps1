@@ -40,8 +40,18 @@ function Clone-At([string]$url, [string]$dir, [string]$ref, [switch]$Submodules)
   }
 }
 
-Clone-At $pins.FIRMWARE_REPO  'firmware'  $pins.FIRMWARE_REF -Submodules
-Clone-At $pins.SIMULATOR_REPO 'simulator' $pins.SIMULATOR_REF
+# Firmware variants, matching VARIANTS in build.py. Each is a separate
+# upstream project with its own simulator and its own web patch.
+$variants = @(
+  @{ Name = 'crosspoint'; Firmware = 'firmware';           Simulator = 'simulator';           Patch = 'simulator-web.patch' }
+  @{ Name = 'crossink';   Firmware = 'firmware-crossink';  Simulator = 'simulator-crossink';  Patch = 'crossink-simulator-web.patch' }
+)
+
+foreach ($v in $variants) {
+  $prefix = $v.Name.ToUpper()
+  Clone-At $pins["${prefix}_FIRMWARE_REPO"]  $v.Firmware  $pins["${prefix}_FIRMWARE_REF"] -Submodules
+  Clone-At $pins["${prefix}_SIMULATOR_REPO"] $v.Simulator $pins["${prefix}_SIMULATOR_REF"]
+}
 
 # Single-header amalgamation the firmware and the simulator's WString.h both
 # depend on. Fetched at the pinned version and checksum-verified.
@@ -71,25 +81,28 @@ if ($got -ne $pins.ARDUINOJSON_SHA256.ToLower()) {
 # `if (git apply --check --reverse ... 2>$null)` threw on exactly the common
 # path -- bootstrap died before it ever applied the patch. Branch on the exit
 # code instead, which is the only reliable signal.
-Write-Host "`n[bootstrap] applying simulator web patch"
-Push-Location simulator
-try {
-  $prev = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  git apply --check --reverse ../patches/simulator-web.patch 2>&1 | Out-Null
-  $alreadyApplied = ($LASTEXITCODE -eq 0)
-  $ErrorActionPreference = $prev
+foreach ($v in $variants) {
+  Write-Host "`n[bootstrap] applying web patch to $($v.Simulator)"
+  Push-Location $v.Simulator
+  try {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    git apply --check --reverse "../patches/$($v.Patch)" 2>&1 | Out-Null
+    $alreadyApplied = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $prev
 
-  if ($alreadyApplied) {
-    Write-Host "  already applied"
-  } else {
-    git apply --verbose ../patches/simulator-web.patch
-    if ($LASTEXITCODE -ne 0) {
-      throw "patch failed to apply - is SIMULATOR_REF ($($pins.SIMULATOR_REF)) still the pinned commit?"
+    if ($alreadyApplied) {
+      Write-Host "  already applied"
+    } else {
+      git apply --verbose "../patches/$($v.Patch)"
+      if ($LASTEXITCODE -ne 0) {
+        $ref = $pins["$($v.Name.ToUpper())_SIMULATOR_REF"]
+        throw "patch failed to apply - is $($v.Name)'s SIMULATOR_REF ($ref) still the pinned commit?"
+      }
     }
+  } finally {
+    Pop-Location
   }
-} finally {
-  Pop-Location
 }
 
 if (-not (Test-Path 'emsdk')) {
@@ -107,15 +120,23 @@ if ($LASTEXITCODE -ne 0) { throw "emsdk activate failed for $($pins.EMSDK_VERSIO
 
 # PlatformIO normally runs these as pre: extra_scripts. build.py does not, so
 # they must run here or the compile fails on missing i18n symbols.
-Write-Host "`n[bootstrap] firmware codegen"
-Push-Location firmware
-try {
-  python scripts/gen_i18n.py --strip-unused
-  if ($LASTEXITCODE -ne 0) { throw "gen_i18n.py failed" }
-  python scripts/build_html.py
-  if ($LASTEXITCODE -ne 0) { throw "build_html.py failed" }
-} finally {
-  Pop-Location
+# The two firmwares name their web-asset step differently (build_html.py vs
+# build_web.py), so run whichever exists rather than hardcoding one.
+foreach ($v in $variants) {
+  Write-Host "`n[bootstrap] $($v.Name) codegen"
+  Push-Location $v.Firmware
+  try {
+    python scripts/gen_i18n.py --strip-unused
+    if ($LASTEXITCODE -ne 0) { throw "gen_i18n.py failed for $($v.Name)" }
+    foreach ($web in @('scripts/build_html.py', 'scripts/build_web.py')) {
+      if (Test-Path $web) {
+        python $web
+        if ($LASTEXITCODE -ne 0) { throw "$web failed for $($v.Name)" }
+      }
+    }
+  } finally {
+    Pop-Location
+  }
 }
 
 if ($WithFs) {
@@ -137,7 +158,7 @@ Write-Host @"
 
 [bootstrap] done. To build:
   . .\emsdk\emsdk_env.ps1
-  python build.py all           # all three models + page + fs
+  python build.py all           # both firmwares + page + fs
   python build.py model x4pro   # one model
   python build.py page          # html/js only
 "@
