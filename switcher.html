@@ -88,22 +88,6 @@
     width: 32px; height: 32px; border: 3px solid #333a44; border-top-color: #7aa2f7;
     border-radius: 50%; animation: spin 1s linear infinite; display: none;
   }
-  /* "Waking…" splash held over the panel across a sleep/wake page reload so the
-     reader never appears to vanish while the runtime + in-memory FS re-init.
-     Paper-white to match the e-ink panel (and the boot splash it reveals). */
-  #wakeOverlay {
-    position: absolute; inset: 8px; border-radius: 4px; z-index: 5;
-    background: #f5f4ef; color: #2a2d33;
-    display: none; flex-direction: column; align-items: center; justify-content: center;
-    gap: 16px; opacity: 1; transition: opacity .4s ease;
-  }
-  #wakeOverlay.show { display: flex; }
-  #wakeOverlay.hide { opacity: 0; }
-  #wakeOverlay .wsp {
-    width: 26px; height: 26px; border: 3px solid #d3d1c7; border-top-color: #6b7078;
-    border-radius: 50%; animation: spin 1s linear infinite;
-  }
-  #wakeOverlay .wl { font-size: 14px; font-weight: 600; letter-spacing: .4px; color: #3a3f47; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
   /* --- 3D device view -------------------------------------------------- */
@@ -138,16 +122,6 @@
     display: block; position: fixed; left: -10000px; top: 0;
     pointer-events: none;
   }
-  /* The wake splash lives inside the (offstage) 2D device, so in 3D it has to be
-     re-anchored to the viewport or waking looks like the model vanished. Fixed
-     positioning escapes the offstage parent; that parent must therefore not be
-     hidden with opacity, which would take this with it. */
-  body.mode3d #wakeOverlay {
-    position: fixed; inset: auto; left: 50%; top: 50%;
-    transform: translate(-50%, -50%);
-    width: 210px; height: 150px; border-radius: 10px;
-    box-shadow: 0 8px 30px rgba(0,0,0,.45);
-  }
   #hint3d {
     position: absolute; left: 0; right: 0; bottom: 4px; text-align: center;
     font-size: 11px; color: #6f7681; pointer-events: none;
@@ -169,7 +143,6 @@
     <canvas id="canvas" width="480" height="800" tabindex="0"
             oncontextmenu="event.preventDefault()"></canvas>
     <div id="spinner" class="spinner"></div>
-    <div id="wakeOverlay"><div class="wsp"></div><div class="wl">Waking&hellip;</div></div>
   </div>
   <div id="stage3d"><div id="hint3d">drag the screen to swipe &middot; drag off it to orbit &middot; click the rockers &amp; side buttons &middot; scroll to zoom</div></div>
   <div class="legend" id="legend"></div>
@@ -180,34 +153,13 @@
     var spinnerEl = document.getElementById('spinner');
     var canvasEl = document.getElementById('canvas');
 
-    // --- Wake bridge ----------------------------------------------------
-    // A device "wake" in the web build is a full page reload (see
-    // cpweb_persist_and_reload). Without this, the panel would flash blank
-    // while the WASM runtime and in-memory filesystem re-initialise. If the
-    // previous page set the wake flag, hold a paper "Waking…" splash over the
-    // panel and drop it when the firmware paints its first frame.
-    (function () {
-      var ov = document.getElementById('wakeOverlay');
-      var waking = false;
-      try { waking = sessionStorage.getItem('cpweb_waking') === '1'; sessionStorage.removeItem('cpweb_waking'); } catch (e) {}
-      if (waking && ov) ov.classList.add('show');
-      var hidden = false;
-      function hideSplash() {
-        if (hidden || !ov) return; hidden = true;
-        ov.classList.add('hide');
-        setTimeout(function () { ov.classList.remove('show', 'hide'); }, 450);
-      }
-      window.cpwebFirstFrame = function () {
-        // Also the readiness latch for anything that calls into the WASM
-        // exports: before the runtime is initialised those symbols exist as
-        // stubs that abort on call, so "is the function defined?" is not a
-        // safe test. A painted frame proves the runtime is live.
-        window.__cpFirstFrame = true;
-        hideSplash();
-      };
-      // Safety net: never leave the splash stuck if boot stalls.
-      if (waking) setTimeout(hideSplash, 15000);
-    })();
+    // Called from the WASM runtime (shims/web_main.cpp) on the first frame it
+    // ever presents, cold boot or after a soft reboot alike. Also the
+    // readiness latch for anything that calls into the WASM exports: before
+    // the runtime is initialised those symbols exist as stubs that abort on
+    // call, so "is the function defined?" is not a safe test. A painted frame
+    // proves the runtime is live.
+    window.cpwebFirstFrame = function () { window.__cpFirstFrame = true; };
 
     // Integer-scale the portrait panel to the largest whole multiple that fits
     // the current window. Uses the SDL backing-store size (canvas.width/height,
@@ -237,48 +189,15 @@
     window.addEventListener('resize', fitPanel);
     fitPanel();
 
-    // --- Loose-file filesystem loader -----------------------------------
-    // The SD-card tree (fonts/books/dictionaries) is served as individual
-    // static files listed in manifest.json, NOT baked into a .data package
-    // (Cloudflare Pages caps a single asset at 25 MiB). Eager files (fonts,
-    // books) are written into MEMFS before main() via an Emscripten run
-    // dependency; deferred files (dictionaries) stream in the background after
-    // boot and are picked up lazily when the user opens Settings.
-    const filesystem = createFilesystemLoader({
-      getFS: () => window.Module.FS,
-      baseUrl: new URL('./', location.href),
-      onProgress: pct => window.Module.setStatus('Loading filesystem… ' + pct + '%'),
-      // Font families other than the selected one stream in after boot. The
-      // firmware discovered fonts once in setup(), so once the last deferred
-      // font has landed, mark its registry dirty; Settings and the reader
-      // re-scan on their next visit, the same path a web-upload takes.
-      onDeferred: entry => {
-        if (!entry.path.startsWith('/fs_/fonts/')) return;
-        const fontsLeft = filesystem.pendingDeferred().some(file => file.path.startsWith('/fs_/fonts/'));
-        if (!fontsLeft && window.Module?._cp_sd_fonts_changed) window.Module._cp_sd_fonts_changed();
-      },
-    });
-    window.fsLoad = filesystem.state;
-    // Start the SD download now, not in preRun: the WASM still has to arrive
-    // and compile, and the eager set is far larger than the runtime. Waiting
-    // for the runtime before opening a single connection left the link idle
-    // for the whole of that download on a first visit.
-    // Only when the firmware can actually run here: without isolation the page
-    // shows the new-tab notice instead of booting, and a download nothing will
-    // consume is pure waste (the reload after the COI service worker installs
-    // reaches this line too).
-    if (window.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined') filesystem.prefetch();
-    const fsLoadEager = () => filesystem.loadEager();
-    const fsLoadDeferred = () => filesystem.loadDeferred().catch(error => console.error('[fs]', error));
-
     // --- First-visit default state (seed) -------------------------------
     // The firmware's runtime state (/.crosspoint: settings, recent list, cover
     // thumbnails) lives in IDBFS, which starts empty for a new visitor. Ship a
     // configured default (Lyra Extended theme, recents + covers, font /
     // dictionary / sleep preset) as seed.json and apply it ONCE, when IDBFS has
     // no settings.json. Returning visitors keep their own state untouched.
-    function cpwebSeedIfEmpty(done) {
-      var FS = Module.FS;
+    // Takes FS explicitly: during preRun the instance isn't resolved yet, so
+    // there is no window.Module to read it from (see bootModule).
+    function cpwebSeedIfEmpty(FS, done) {
       var seeded = false;
       try { seeded = FS.analyzePath('/fs_/.crosspoint/settings.json').exists; } catch (e) {}
       if (seeded) { done(); return; }  // returning visitor — never overwrite
@@ -307,57 +226,176 @@
         .catch(function (e) { console.error('[seed] fetch failed', e); done(); });
     }
 
-    // Emscripten reads a global `Module`. Define it before injecting <model>.js.
-    window.Module = {
-      canvas: (function () {
-        canvasEl.addEventListener('webglcontextlost', function (e) {
-          statusEl.textContent = 'Graphics context lost — reload the page.';
-          e.preventDefault();
-        }, false);
-        return canvasEl;
-      })(),
-      print: function (t) { console.log(t); },
-      printErr: function (t) { console.error(t); },
-      setStatus: function (t) {
-        if (!statusEl) return;
-        if (t) { statusEl.textContent = t; spinnerEl.style.display = 'block'; }
-        else { statusEl.textContent = ''; spinnerEl.style.display = 'none'; }
-      },
-      preRun: [function () {
-        // Persist the firmware's runtime state tree (/.crosspoint: reading
-        // position, section caches, settings) across sleep/wake page reloads via
-        // IDBFS (IndexedDB). A web "wake" is a page reload, so this restores
-        // state exactly as the device restores from SD after a power-wake.
-        // Mounted before main() and populated (syncfs true) while a run
-        // dependency holds startup. Degrades gracefully if IndexedDB is blocked.
-        Module.addRunDependency('fs-idbfs');
-        try {
-          Module.FS.mkdirTree('/fs_/.crosspoint');
-          Module.FS.mount(Module.FS.filesystems.IDBFS, {}, '/fs_/.crosspoint');
-          Module.FS.syncfs(true, function (err) {
-            if (err) console.error('[idbfs] initial load failed', err);
-            cpwebSeedIfEmpty(function () { Module.removeRunDependency('fs-idbfs'); });
-          });
-        } catch (e) {
-          console.error('[idbfs] mount failed (state will not persist)', e);
-          Module.removeRunDependency('fs-idbfs');
-        }
+    // The WebGL context lives on the canvas across a soft reboot (bootModule
+    // never recreates the element), so this only needs attaching once.
+    canvasEl.addEventListener('webglcontextlost', function (e) {
+      statusEl.textContent = 'Graphics context lost — reload the page.';
+      e.preventDefault();
+    }, false);
 
-        // Populate MEMFS from loose static files before main() runs. The run
-        // dependency holds startup until the eager (font/book) set is written.
-        Module.addRunDependency('fs-loose');
-        fsLoadEager().then(function () {
-          Module.removeRunDependency('fs-loose');
-        }).catch(function (e) {
-          window.fsLoad.error = String(e);
-          console.error('[fs] eager load failed', e);
-          if (Module.setStatus) Module.setStatus('Filesystem load failed: ' + e.message);
-          spinnerEl.style.display = 'none';
-          // Keep startup blocked: partially loaded fonts/books are not a valid
-          // library, and starting main() would erase the useful error status.
-        });
-      }],
-      onRuntimeInitialized: function () { canvasEl.focus(); fitPanel(); fsLoadDeferred(); }
+    // The glue script defines this once, as window.CPModule_<id with dashes
+    // as underscores> (see EXPORT_NAME in build.py's link_model). It is a
+    // factory: MODULARIZE wraps everything, including top-level class/let/
+    // const declarations that would otherwise collide on a second <script>
+    // tag, inside this function, so calling it again -- rather than
+    // re-injecting the script -- is what makes a sleep/wake soft reboot
+    // possible. Loaded at most once per page life; cached here.
+    let factoryPromise = null;
+    function loadFactory(model) {
+      if (factoryPromise) return factoryPromise;
+      factoryPromise = new Promise((resolveFactory, rejectFactory) => {
+        const s = document.createElement('script');
+        s.src = model.id + '.js';
+        s.async = true;
+        s.onload = function () {
+          const name = 'CPModule_' + model.id.replace(/-/g, '_');
+          const factory = window[name];
+          if (typeof factory !== 'function') rejectFactory(new Error(name + ' missing from ' + s.src));
+          else resolveFactory(factory);
+        };
+        s.onerror = function () {
+          rejectFactory(new Error('Failed to load ' + s.src +
+            ' — run: python build.py model ' + model.id.split('-')[0]));
+        };
+        document.body.appendChild(s);
+      });
+      return factoryPromise;
+    }
+
+    // The live instance from the most recent bootModule() call. Module-scoped
+    // rather than window.Module directly because preRun callbacks run before
+    // the factory's promise resolves -- there is no window.Module yet at that
+    // point, only the config object below, which Emscripten fills in in place.
+    let currentInstance = null;
+
+    // Boot (or reboot) the selected firmware bundle against #canvas. Cold boot
+    // calls this once; cpwebSoftReboot below calls it again in place after a
+    // device "wake" from deep sleep instead of navigating the browser, so
+    // everything here -- the loose-file loader included -- has to tolerate
+    // running a second time with a brand new instance and no side effects
+    // left over from the last one.
+    async function bootModule(model) {
+      window.__cpFirstFrame = false;
+      canvasEl.width = model.w;
+      canvasEl.height = model.h;
+      fitPanel();
+
+      // --- Loose-file filesystem loader ---------------------------------
+      // The SD-card tree (fonts/books/dictionaries) is served as individual
+      // static files listed in manifest.json, NOT baked into a .data package
+      // (Cloudflare Pages caps a single asset at 25 MiB). Eager files (fonts,
+      // books) are written into MEMFS before main() via an Emscripten run
+      // dependency; deferred files (dictionaries) stream in the background
+      // after boot and are picked up lazily when the user opens Settings.
+      // config.FS (not currentInstance.FS): see the config declaration below.
+      const filesystem = createFilesystemLoader({
+        getFS: () => config.FS,
+        baseUrl: new URL('./', location.href),
+        onProgress: pct => config.setStatus('Loading filesystem… ' + pct + '%'),
+        // Font families other than the selected one stream in after boot. The
+        // firmware discovered fonts once in setup(), so once the last deferred
+        // font has landed, mark its registry dirty; Settings and the reader
+        // re-scan on their next visit, the same path a web-upload takes.
+        onDeferred: entry => {
+          if (!entry.path.startsWith('/fs_/fonts/')) return;
+          const fontsLeft = filesystem.pendingDeferred().some(file => file.path.startsWith('/fs_/fonts/'));
+          if (!fontsLeft && currentInstance?._cp_sd_fonts_changed) currentInstance._cp_sd_fonts_changed();
+        },
+      });
+      window.fsLoad = filesystem.state;
+      // Start the SD download now, not in preRun: the WASM still has to arrive
+      // and compile, and the eager set is far larger than the runtime. Waiting
+      // for the runtime before opening a single connection left the link idle
+      // for the whole of that download on a first visit.
+      // Only when the firmware can actually run here: without isolation the page
+      // shows the new-tab notice instead of booting, and a download nothing will
+      // consume is pure waste (the reload after the COI service worker installs
+      // reaches this line too).
+      if (window.crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined') filesystem.prefetch();
+
+      // Passed to the factory below. Emscripten fills this SAME object in
+      // place (FS, addRunDependency, …) as it starts up, rather than building
+      // a separate one, so preRun can already reference it by this closure
+      // before the factory's promise -- and window.Module -- exist.
+      const config = {
+        canvas: canvasEl,
+        print: function (t) { console.log(t); },
+        printErr: function (t) { console.error(t); },
+        setStatus: function (t) {
+          if (!statusEl) return;
+          if (t) { statusEl.textContent = t; spinnerEl.style.display = 'block'; }
+          else { statusEl.textContent = ''; spinnerEl.style.display = 'none'; }
+        },
+        preRun: [function () {
+          // Persist the firmware's runtime state tree (/.crosspoint: reading
+          // position, section caches, settings) across visits via IDBFS
+          // (IndexedDB). Mounted before main() and populated (syncfs true)
+          // while a run dependency holds startup. Degrades gracefully if
+          // IndexedDB is blocked.
+          config.addRunDependency('fs-idbfs');
+          try {
+            config.FS.mkdirTree('/fs_/.crosspoint');
+            config.FS.mount(config.FS.filesystems.IDBFS, {}, '/fs_/.crosspoint');
+            config.FS.syncfs(true, function (err) {
+              if (err) console.error('[idbfs] initial load failed', err);
+              cpwebSeedIfEmpty(config.FS, function () { config.removeRunDependency('fs-idbfs'); });
+            });
+          } catch (e) {
+            console.error('[idbfs] mount failed (state will not persist)', e);
+            config.removeRunDependency('fs-idbfs');
+          }
+
+          // Populate MEMFS from loose static files before main() runs. The run
+          // dependency holds startup until the eager (font/book) set is written.
+          config.addRunDependency('fs-loose');
+          filesystem.loadEager().then(function () {
+            config.removeRunDependency('fs-loose');
+          }).catch(function (e) {
+            window.fsLoad.error = String(e);
+            console.error('[fs] eager load failed', e);
+            config.setStatus('Filesystem load failed: ' + e.message);
+            spinnerEl.style.display = 'none';
+            // Keep startup blocked: partially loaded fonts/books are not a valid
+            // library, and starting main() would erase the useful error status.
+          });
+        }],
+        onRuntimeInitialized: function () {
+          canvasEl.focus();
+          fitPanel();
+          filesystem.loadDeferred().catch(error => console.error('[fs]', error));
+        },
+      };
+
+      try {
+        const factory = await loadFactory(model);
+        const instance = await factory(config);
+        currentInstance = instance;
+        // Kept as window.Module too: the 3D view, the console, and the smoke
+        // suite all read the live instance this way.
+        window.Module = instance;
+      } catch (e) {
+        console.error('[boot] failed', e);
+        statusEl.textContent = String(e?.message || e);
+      }
+    }
+
+    // A device "wake" from deep sleep matches a real power-button press on
+    // every other target (desktop simulator, hardware): a fresh boot, not a
+    // resume-in-place (see startDeepSleep() in patches/simulator-web.patch).
+    // The C++ side (shims/web_main.cpp) already stopped its own main loop and
+    // SDL instance and persisted state to IDBFS before calling this. Getting
+    // that fresh boot without a visible page reload means tearing down the
+    // outgoing instance's worker pool and calling the SAME factory again for
+    // a new one -- SDL_Quit() already released the canvas's GL context and
+    // its own input listeners, so the fresh instance can claim both again
+    // from scratch. Nothing about the page itself (the three.js scene,
+    // camera, scroll position) is touched, and the canvas keeps showing its
+    // last frame -- the sleep screen -- until the new instance's first frame
+    // paints over it, so there is nothing to paper over with a splash.
+    window.cpwebSoftReboot = function () {
+      try { currentInstance?.PThread?.terminateAllThreads?.(); }
+      catch (e) { console.error('[reboot] thread teardown failed', e); }
+      bootModule(window.__cpModel);
     };
 
     // Keep keyboard focus on the panel; stop arrows/space from scrolling the page.
@@ -380,7 +418,7 @@
     // Flush the IDBFS-backed /.crosspoint state to IndexedDB when the tab is
     // hidden or closed, so your reading position survives a plain tab close as
     // it would on the device (which writes progress to SD continuously). The
-    // explicit sleep/wake path persists on its own before reloading.
+    // explicit sleep/wake path persists on its own before rebooting.
     var __cpwebSyncing = false;
     function cpwebSyncState() {
       if (!window.__cpFirstFrame || __cpwebSyncing || !window.Module || !Module.FS || !Module.FS.syncfs) return;
@@ -461,18 +499,7 @@
         window.__cpModel = model;
         buildSelector(models, model);
         buildLegend(model);
-        canvasEl.width = model.w;
-        canvasEl.height = model.h;
-        fitPanel();
-
-        var s = document.createElement('script');
-        s.src = model.id + '.js';
-        s.async = true;
-        s.onerror = function () {
-          statusEl.textContent = 'Failed to load ' + s.src +
-            ' — run: python build.py model ' + model.id.split('-')[0];
-        };
-        document.body.appendChild(s);
+        bootModule(model);
       })
       .catch(function () {
         statusEl.textContent =
@@ -540,6 +567,10 @@
         dev = new Device3D(stage, { fbW: model?.h || 800, fbH: model?.w || 480, ...calibration });
         window.__dev3d = dev;   // handy for calibration from the console
         const info = await dev.load((m) => setNote(m));
+        // A device "wake" from deep sleep no longer touches the page at all
+        // (see cpwebSoftReboot in the other module script) -- this Device3D
+        // instance, its camera and the orbit the user left it at all simply
+        // survive, untouched, across the firmware's own reboot underneath.
         if (window.__mode3d) dev.start();
         setNote(info.tris.toLocaleString() + ' tris');
 
@@ -611,8 +642,9 @@
       canvasEl.focus({ preventScroll: true });
       window.__mode3d = on;
 
-      // A device "wake" is a full page reload, so the chosen view has to live in
-      // the URL or waking always drops you back into 2D.
+      // Sharable/refreshable: a manual page reload (not a device "wake", which
+      // no longer touches the page) should still come back up in the view the
+      // link asked for.
       try {
         const u = new URL(location.href);
         if (on) u.searchParams.set('view', '3d');

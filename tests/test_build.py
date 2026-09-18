@@ -124,6 +124,21 @@ class BuildTests(unittest.TestCase):
         self.assertNotIn('firmware_link_stubs.cpp', build.VARIANTS['crosspoint']['exclude'])
         self.assertIn('firmware_link_stubs.cpp', build.VARIANTS['crossink']['exclude'])
 
+    def test_crossink_frontlight_is_exported_from_its_own_singleton(self):
+        # CrossInk's firmware drives the inline HalFrontlight in its own
+        # include/CrossInkHalFrontlight.h, not the simulator's. Exporting from
+        # the simulator read a light nobody switched on.
+        build.use_variant('crossink')
+        sources = [build.norm(s) for s in build.collect_sources()]
+        self.assertFalse(any(s.endswith('/simulator-crossink/src/halfrontlight.cpp') for s in sources),
+                         "the simulator's HalFrontlight must not be compiled for CrossInk")
+        self.assertTrue(any(s.endswith('/shims/crossink/frontlight_exports.cpp') for s in sources))
+        build.use_variant('crosspoint')
+        sources = [build.norm(s) for s in build.collect_sources()]
+        self.assertTrue(any(s.endswith('/simulator/src/halfrontlight.cpp') for s in sources))
+        self.assertFalse(any('/shims/crossink/' in s for s in sources))
+        build.use_variant(build.ENABLED_VARIANTS[0])
+
 
 if __name__ == '__main__':
     unittest.main()

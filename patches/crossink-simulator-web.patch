@@ -204,27 +204,6 @@ index 7a0bbf3..61a7731 100644
    // Simulator only: returns true once a hard shutdown has been requested.
    bool shouldQuit() const;
  
-diff --git a/src/HalFrontlight.cpp b/src/HalFrontlight.cpp
-index e5c4cd5..3a65200 100644
---- a/src/HalFrontlight.cpp
-+++ b/src/HalFrontlight.cpp
-@@ -43,3 +43,16 @@ uint8_t HalFrontlight::brightness() const { return lastBrightness; }
- uint8_t HalFrontlight::warmth() const { return lastWarmth; }
- 
- bool HalFrontlight::isOn() const { return lit; }
-+
-+#ifdef __EMSCRIPTEN__
-+#include <emscripten.h>
-+// The web build's 3D view lights the panel from these: the framebuffer itself
-+// never changes with the frontlight, exactly as on the device, so the glow has
-+// to be added where the panel is drawn. Polled per frame; all trivially cheap.
-+extern "C" {
-+EMSCRIPTEN_KEEPALIVE int cp_frontlight_present() { return Frontlight.present() ? 1 : 0; }
-+EMSCRIPTEN_KEEPALIVE int cp_frontlight_on() { return Frontlight.isOn() ? 1 : 0; }
-+EMSCRIPTEN_KEEPALIVE int cp_frontlight_brightness() { return Frontlight.brightness(); }
-+EMSCRIPTEN_KEEPALIVE int cp_frontlight_warmth() { return Frontlight.warmth(); }
-+}
-+#endif
 diff --git a/src/HalGPIO.cpp b/src/HalGPIO.cpp
 index af75883..108fe74 100644
 --- a/src/HalGPIO.cpp

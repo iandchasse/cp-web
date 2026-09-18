@@ -77,9 +77,11 @@ Release references: [Three.js r186](https://github.com/mrdoob/three.js/releases/
    from Settings until the next reload, because font discovery runs once at boot.
 
 3. **The firmware runtime is not yet a React component.** Global Module, SDL input,
-   worker lifetime, IDBFS state and reload-based wake still belong to the document.
-   This pass extracts reusable data adapters and a renderer lifecycle; it does not
-   make the entire firmware safe to mount/unmount repeatedly in an SPA.
+   worker lifetime and IDBFS state still belong to the document, and the sleep/wake
+   soft reboot (`cpwebSoftReboot` in `switcher.html`) assumes it owns `#canvas` and
+   the page's `window.Module`/`window.PThread` globals outright. This pass extracts
+   reusable data adapters and a renderer lifecycle; it does not make the entire
+   firmware safe to mount/unmount repeatedly in an SPA.
 4. **Persistence is best effort.** Visibility-triggered async saves are not a
    guarantee on tab/process termination. Seed files also apply individually, so
    partial seeding can leave settings present while other default files are absent.
@@ -202,6 +204,44 @@ building before any of the wiring was written.
   names exceed the 32k Windows command-line limit (WinError 206).
 - CrossInk's WASM is 6.69 MB against CrossPoint's 5.68 MB; only the selected
   build is fetched, so a visit still downloads one runtime.
+
+## CrossInk frontlight and a seamless sleep/wake — 2026-09-18
+
+- **CrossInk's frontlight exports read the wrong singleton.** The crossink
+  patch appended `cp_frontlight_*` to `simulator-crossink/src/HalFrontlight.cpp`,
+  copying CrossPoint's approach — but CrossInk's firmware never touches that
+  file under `SIMULATOR`. `include/CrossInkHalFrontlight.h` defines its own
+  header-only `HalFrontlight`, and `#define Frontlight HalFrontlight::
+  getInstance()` sends every firmware call site there instead. The exports
+  read a light nobody switched, so the 3D panel's drawer worked but the panel
+  never lit. Fix: exclude the simulator's `HalFrontlight.cpp` for this variant
+  (`VARIANTS["crossink"]["exclude"]` in `build.py`) and export from the real
+  singleton in a new `shims/crossink/frontlight_exports.cpp` instead. The smoke
+  suite's end-to-end frontlight check, previously CrossPoint-only because this
+  bug made CrossInk's half of it hang, now runs identically on both.
+- **Sleep/wake no longer touches the page.** A device "wake" was a real
+  `location.reload()` — correctness-motivated (every other target treats a
+  power-button wake as a fresh boot: see `startDeepSleep()`), but a real
+  navigation is visible no matter how fast it is, so it needed a "Waking…"
+  splash to cover the gap. Getting the same fresh boot without ever navigating
+  turned out to need three things working together: `SDL_Quit()` on wake
+  (releases the canvas's WebGL context and Emscripten's own input listeners on
+  it), `-sMODULARIZE=1` (without it, re-injecting the same `<script>` throws
+  `SyntaxError: Identifier 'EmscriptenEH' has already been declared` — its
+  top-level `class`/`let`/`const` declarations collide the second time; wrapped
+  in a factory function, they don't), and `PThread.terminateAllThreads()`
+  before calling that factory again. See README.md's "Sleep and wake" for the
+  full sequence. The old splash and its sessionStorage handshake are gone —
+  there is nothing left to paper over.
+- **Both firmwares share one IDBFS-backed `.crosspoint` tree** (same origin,
+  same mount point, deliberately — see "Two firmwares" below), which the smoke
+  suite's own sleep/wake check now writes to. Each build's cold boot needs a
+  clean slate, so the harness clears IndexedDB between builds
+  (`Storage.clearDataForOrigin`) rather than relying on the previous build to
+  tidy up after itself through the UI — which was tried first and proved
+  fragile: "the frontlight quick panel opens on a top-edge swipe" is only true
+  from Home, and *which* screen a woken instance resumes into depends on
+  exactly where sleep caught it, not on how many `Escape` presses came before.
 
 ## Validation
 

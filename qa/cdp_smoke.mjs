@@ -69,6 +69,11 @@ try {
   console.log('builds: ' + builds.map(b => b.label).join(', '));
   for (const build of builds) {
     const model = build.id;
+    // Both firmwares share one IDBFS-backed .crosspoint tree (same origin,
+    // same mount point -- see README.md's "Firmware variants"), so whatever
+    // state one build's sleep/wake test persists would otherwise leak into
+    // the next build's cold boot. Each build gets a truly clean IndexedDB.
+    await send('Storage.clearDataForOrigin', { origin: base.origin, storageTypes: 'indexeddb' });
     const url = new URL(base);
     url.searchParams.set('model', model);
     await send('Page.navigate', { url: String(url) });
@@ -138,39 +143,72 @@ try {
     await js(`window.__dev3d.getFrontlight = window.__realFrontlight`);
 
     // End to end through the firmware's own UI. The quick panel opens on a
-    // top-edge down-swipe in both, but only CrossPoint toggles the light with
-    // Enter -- CrossInk's drawer has its own lamp control -- so drive the whole
-    // path only where a keypress is the documented toggle.
-    if (build.firmware === 'CrossPoint') {
-      await js('document.getElementById("view3d").click()');
-      await sleep(800);
-      // The quick panel opens from Home, FileBrowser or Settings, never from
-      // the reader, and the content check above leaves a book open.
-      for (let back = 0; back < 3; back++) {
-        await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-        await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
-        await sleep(700);
-      }
-      const panel = await js('(() => { const r = document.getElementById("canvas").getBoundingClientRect(); return { x: r.left + r.width / 2, top: r.top, h: r.height }; })()');
-      const from = panel.top + 8;
-      const to = panel.top + Math.round(panel.h * 0.35);
-      await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: panel.x, y: from, button: 'left', buttons: 1, clickCount: 1 });
-      for (let step = 1; step <= 6; step++) {
-        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: panel.x,
-          y: from + Math.round((to - from) * step / 6), button: 'left', buttons: 1 });
-        await sleep(30);
-      }
-      await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: panel.x, y: to, button: 'left', buttons: 0, clickCount: 1 });
-      await sleep(2000);
-      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-      await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-      await until(() => js('Module._cp_frontlight_on() === 1'), 'firmware frontlight on', 10000);
-      await js('document.getElementById("view3d").click()');
-      await until(() => js('!!window.__dev3d?.ready'), '3D back after the quick panel');
-      await until(() => js('window.__dev3d.screen.material.emissiveIntensity > 0'),
-                  'panel lit from the firmware itself', 10000);
-      console.log(`${model}: quick panel lit the 3D panel end to end`);
+    // top-edge down-swipe and toggles the light with Enter in both firmwares;
+    // CrossInk drives its own inline HalFrontlight (shims/crossink/
+    // frontlight_exports.cpp), not the simulator library's, so this is what
+    // catches the two ending up out of sync again.
+    await js('document.getElementById("view3d").click()');
+    await sleep(800);
+    // The quick panel opens from Home, FileBrowser or Settings, never from
+    // the reader, and the content check above leaves a book open.
+    for (let back = 0; back < 3; back++) {
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await sleep(700);
     }
+    const panel = await js('(() => { const r = document.getElementById("canvas").getBoundingClientRect(); return { x: r.left + r.width / 2, top: r.top, h: r.height }; })()');
+    const from = panel.top + 8;
+    const to = panel.top + Math.round(panel.h * 0.35);
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: panel.x, y: from, button: 'left', buttons: 1, clickCount: 1 });
+    for (let step = 1; step <= 6; step++) {
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: panel.x,
+        y: from + Math.round((to - from) * step / 6), button: 'left', buttons: 1 });
+      await sleep(30);
+    }
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: panel.x, y: to, button: 'left', buttons: 0, clickCount: 1 });
+    await sleep(2000);
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await until(() => js('Module._cp_frontlight_on() === 1'), 'firmware frontlight on', 10000);
+    await js('document.getElementById("view3d").click()');
+    await until(() => js('!!window.__dev3d?.ready'), '3D back after the quick panel');
+    await until(() => js('window.__dev3d.screen.material.emissiveIntensity > 0'),
+                'panel lit from the firmware itself', 10000);
+    console.log(`${model}: quick panel lit the 3D panel end to end`);
+
+    // Sleep and wake must be seamless: no page navigation, no dropped 3D
+    // scene, just the WASM instance rebooting in place (see README.md's
+    // "Sleep and wake"). Back at Home first -- the sleep hotkey is ignored
+    // while the quick panel is open.
+    for (let back = 0; back < 3; back++) {
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+      await sleep(400);
+    }
+    await js('window.__cpwebSmokeMarker = "pre-sleep"; window.Module.__cpwebSmokeTag = "pre-sleep"');
+    const dev3dBefore = await js('window.__dev3d ? window.__dev3d.uuid || (window.__dev3d.uuid = Math.random()) : null');
+    // 's' forces immediate sleep (a debug-only shortcut); 'p' is the power
+    // button, which the poll in HalGPIO::pollWebSleepWake() treats as wake.
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
+    await sleep(500);
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'p', code: 'KeyP', windowsVirtualKeyCode: 80 });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'p', code: 'KeyP', windowsVirtualKeyCode: 80 });
+    // A real navigation would drop every JS global, including this one.
+    await until(() => js('window.__cpwebSmokeMarker === "pre-sleep"'), 'no page navigation on wake', 5000);
+    await until(() => js('window.Module?.__cpwebSmokeTag !== "pre-sleep"'), 'WASM instance rebooted in place', 15000);
+    await until(() => js('!!window.__cpFirstFrame'), 'firmware ready again after wake', 15000);
+    assert.equal(await js('window.__dev3d ? window.__dev3d.uuid : null'), dev3dBefore,
+      'the 3D scene must survive a wake untouched');
+    assert.equal(await js('typeof Module._cp_frontlight_on'), 'function', 'frontlight exports missing after wake');
+    // Not asserting a specific value: the light was just turned on above, and
+    // the fresh boot legitimately restores that from persisted state, same as
+    // a real wake. A thrown/rejected call here (an unresolved import symbol,
+    // an abort) would fail this await; getting a real 0/1 back is what
+    // proves the export is alive, not a stub.
+    assert.ok([0, 1].includes(await js('Module._cp_frontlight_on()')), 'frontlight export did not return a real state');
+    console.log(`${model}: sleep/wake rebooted the WASM instance without touching the page`);
+
     // Drive a real physical-button press through the capture listeners.
     const button = await js('window.__dev3d.buttonToClient("down")');
     await send('Input.dispatchMouseEvent', { type: 'mousePressed', ...button, button: 'left', buttons: 1, clickCount: 1 });

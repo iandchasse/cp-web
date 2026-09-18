@@ -36,7 +36,7 @@ compression, of which only 9.2 MiB is fetched before the reader starts.
 | `switcher.html` | The page: model picker, 2D/3D toggle, boot loader, input routing. |
 | `three/` | Vendored three.js, `cp3d.js` (the 3D view), and `x4-device.3mf`. |
 | `runtime/frontlight.js` | Maps the firmware's frontlight to an emissive term; e-paper reflectance LUT. |
-| `shims/` | Host shims the firmware links against, incl. the sleep/wake reload. |
+| `shims/` | Host shims the firmware links against, incl. the sleep/wake soft reboot. |
 | `seed.json` | Source first-visit state; curated at build time against the shipped library. |
 | `sd-profile.json` | Optional `--slim` allowlist: books only, no SD fonts or dictionary. |
 | `patches/` | One web patch per simulator, not yet upstream (see below). |
@@ -216,9 +216,11 @@ same simulator file, which is why exclusions are per variant rather than global.
 Files under `shims/<variant>/` compile only into that variant.
 
 The quick panel differs too: both open the frontlight drawer on a top-edge
-down-swipe, but only CrossPoint toggles the light with Enter, so the smoke
-suite drives the full firmware-to-3D path there and asserts the state mapping
-directly on both.
+down-swipe and toggle the light with Enter, but CrossInk drives its own
+inline `HalFrontlight` singleton (`include/CrossInkHalFrontlight.h`) instead
+of the simulator library's — `shims/crossink/frontlight_exports.cpp` exports
+from that one instead, and the simulator's own `HalFrontlight.cpp` is excluded
+for this variant (see `VARIANTS` in `build.py`) so nothing shadows it.
 
 ## The simulator patch
 
@@ -227,7 +229,11 @@ upstream:
 
 - the `cp_fb_*` framebuffer exports in `HalDisplay`, which the 3D view samples;
 - the `__EMSCRIPTEN__` sleep/wake shim in `HalGPIO`, since a browser tab cannot
-  actually power down — wake is a real `location.reload()`.
+  actually power down — the web build parks the firmware loop() and waits for
+  the power button instead. Wake still needs to be a fresh boot, matching
+  every other target (see `startDeepSleep()`), but doing that without a
+  visible page reload takes more than HalGPIO alone: see the "Sleep and wake"
+  section below.
 
 Without it the build still links, but the 3D panel renders blank.
 `bootstrap.ps1` applies it and is safe to re-run. When a pin moves and the patch
@@ -235,6 +241,40 @@ conflicts, resolve it in `simulator/` and re-export with `git -C simulator diff`
 
 > Watch the encoding: PowerShell's `>` writes UTF-16, which git rejects with
 > "No valid patches in input". Write it with `UTF8Encoding($false)`.
+
+## Sleep and wake
+
+Every other target — hardware, the desktop simulator (`SimulatorLifecycle::
+rebootAsPowerWake()`) — treats a power-button wake from deep sleep as a fresh
+boot, not a resume in place, so the web build matches that rather than
+inventing its own semantics. The naive way to get a fresh boot in a browser is
+`location.reload()`, and that's what shipped first: it works, but a real page
+navigation is visible (tab spinner, DOM torn down and rebuilt, the three.js
+scene and camera reset) no matter how fast it is, so it needed a "Waking…"
+splash to cover the gap.
+
+`shims/web_main.cpp` and `switcher.html` now do the fresh boot without ever
+navigating the browser:
+
+1. `HalGPIO::pollWebSleepWake()` detects the power button; `main_tick()`
+   cancels the main loop and calls `SDL_Quit()` immediately, which releases
+   the canvas's WebGL context and the input listeners Emscripten's SDL2 port
+   registered on it.
+2. `cpweb_persist_and_reboot()` (EM_JS) syncs `/fs_/.crosspoint` to IndexedDB,
+   then calls `window.cpwebSoftReboot()`.
+3. `cpwebSoftReboot()` terminates the outgoing instance's pthread pool
+   (`PThread.terminateAllThreads()`) and calls `bootModule()` again — the same
+   function cold boot uses, with a fresh loose-file loader and a fresh
+   `Module` — which injects a new `<model>.js` `<script>` tag against the same
+   `#canvas`.
+
+Nothing on the page outside the WASM instance is touched: the three.js scene,
+camera and scroll position all survive untouched, and the canvas keeps
+showing its last frame (the sleep screen) until the fresh instance's first
+frame paints over it, so there's nothing to paper over with a splash.
+`bootModule()` has to tolerate running a second time with zero state carried
+over in JS — every closure it captures (the filesystem loader, `Module`) is
+created fresh on each call.
 
 ## CI
 

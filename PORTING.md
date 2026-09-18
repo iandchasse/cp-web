@@ -47,12 +47,22 @@ Always call `dispose()` when removing a renderer, including after a failed load.
    isolated. The current GitHub Pages iframe is cross-origin, so its heap is not
    accessible this way. The SDL canvas must stay laid out for input forwarding.
 4. For a direct runtime integration, add an Emscripten modular factory build and
-   explicit runtime lifecycle. This pass does not make the C++ program restartable:
-   it still has global state, worker threads, `window.Module`, a main loop, and
-   sleep/wake calls that reload its owning document. A React component cannot
-   dispose those merely by removing a canvas. A same-origin iframe remains a
-   useful lifetime boundary until factory startup, worker termination, input,
-   persistence and wake behavior are explicitly implemented and tested.
+   explicit runtime lifecycle. This pass does not make the C++ program restartable
+   as a general React unmount/remount: it still has global state, worker threads
+   and a single `window.Module`. A React component cannot dispose those merely by
+   removing a canvas. That said, `switcher.html`'s `cpwebSoftReboot()` (see
+   README.md's "Sleep and wake") is a working, tested example of tearing the
+   instance down and booting a fresh one *in place*, without ever navigating the
+   document: `SDL_Quit()` releases the canvas's GL context and input listeners,
+   `PThread.terminateAllThreads()` clears the worker pool, and the same boot
+   function runs again against a fresh `Module`. That is close to the sequence a
+   real unmount/remount would need, minus the modular-factory wrapping (this build
+   is not `-sMODULARIZE`, so its globals just get redeclared on each `<script>`
+   injection rather than cleanly scoped) and minus the current build's assumption
+   that only one instance ever exists on the page at a time. A same-origin iframe
+   remains a useful lifetime boundary until factory startup, worker termination,
+   input, persistence and this reboot sequence are adapted to that stricter model
+   and tested.
 
 The example uses `useFrame` and expects a continuously ticking R3F canvas while
 the demo is active. With `frameloop="demand"`, arrange an external frame-change

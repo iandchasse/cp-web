@@ -90,7 +90,11 @@ VARIANTS = {
         "sdk_libs": [("network", "NearbyTransfer")],
         "exclude": ["firmware_link_stubs.cpp",   # CrossInk defines these itself
                     "/halclocksim/",             # second HalClock implementation
-                    "simulatorsmoketest.cpp"],   # host-only, uses try/catch
+                    "simulatorsmoketest.cpp",    # host-only, uses try/catch
+                    # CrossInk's include/CrossInkHalFrontlight.h is its own
+                    # header-only HalFrontlight; the simulator's is a second,
+                    # unused instance. shims/crossink exports from the real one.
+                    "/simulator-crossink/src/halfrontlight.cpp"],
     },
 }
 # Variants that are built, advertised in models.json and deployed.
@@ -479,6 +483,13 @@ def link_model(variant, model_id):
         print(f"[{bundle}] {len(missing)} objects missing; compile first")
         return 1
     os.makedirs(DIST, exist_ok=True)
+    # A JS identifier the page can call more than once. MODULARIZE wraps the
+    # whole glue -- including top-level `class`/`let`/`const` declarations
+    # that would otherwise throw "already declared" on a second <script> tag
+    # -- inside this factory function, so switcher.html's sleep/wake soft
+    # reboot can call it again for a fresh instance without ever reloading the
+    # page. Named per bundle so two builds never fight over one global.
+    export_name = "CPModule_" + bundle.replace("-", "_")
     link = [
         "em++", "-O2", "-pthread",
         "-sUSE_SDL=2",
@@ -492,11 +503,15 @@ def link_model(variant, model_id):
         "-sASSERTIONS=1",
         "-sFORCE_FILESYSTEM=1",
         "-sSTACK_SIZE=1048576",
+        "-sMODULARIZE=1",
+        f"-sEXPORT_NAME={export_name}",
         # FS + run-dependency hooks let the page loader write the SD tree into
         # MEMFS before main(). No --preload-file: the fs_ tree is served as loose
         # static files (see copy_fs) because Cloudflare Pages caps assets at
         # 25 MiB and our dictionary/font set exceeds that as one package.
-        "-sEXPORTED_RUNTIME_METHODS=FS,addRunDependency,removeRunDependency,HEAPU8,HEAPU32",
+        # PThread: switcher.html tears down a sleeping instance's worker pool
+        # (PThread.terminateAllThreads()) before booting the fresh one.
+        "-sEXPORTED_RUNTIME_METHODS=FS,addRunDependency,removeRunDependency,HEAPU8,HEAPU32,PThread",
         "-lidbfs.js",
     ]
     # Pass the objects in a response file: two variants' worth of mangled

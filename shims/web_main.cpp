@@ -29,30 +29,30 @@ extern void loop();
 extern HalDisplay display;  // defined in firmware main.cpp
 
 // Persist the firmware's runtime state tree (/fs_/.crosspoint, mounted as IDBFS
-// by the page loader) to IndexedDB, then reload the page. A reload is the
-// browser equivalent of a deep-sleep wake reset: main() re-runs, the loader
-// restores /fs_/.crosspoint from IDBFS, and setup() resumes the open book from
-// state.json + progress.bin — just like the device restoring from SD after a
-// power-wake. Falls back to a plain reload if IndexedDB is unavailable.
-EM_JS(void, cpweb_persist_and_reload, (), {
-  // Mark this reload as a device "wake" so the page can hold a paper "Waking…"
-  // splash over the panel until the firmware paints its first frame, instead of
-  // flashing a blank canvas while the runtime + in-memory filesystem re-init.
-  try { sessionStorage.setItem('cpweb_waking', '1'); } catch (e) {}
+// by the page loader) to IndexedDB, then hand off to the page to reboot the
+// WASM instance in place -- see cpwebSoftReboot in switcher.html. The fresh
+// instance's own preRun remounts IDBFS and its setup() resumes the open book
+// from state.json + progress.bin, reading back exactly what this call is
+// about to write, just like the device restoring from SD after a power-wake.
+// Falls back to rebooting without persisting if IndexedDB is unavailable: by
+// the time this runs the main loop is already stopped (see main_tick()), so
+// there is nothing left to lose by not waiting on it.
+EM_JS(void, cpweb_persist_and_reboot, (), {
   try {
     if (typeof Module !== 'undefined' && Module.FS && Module.FS.syncfs) {
       Module.FS.syncfs(false, function (err) {
         if (err) { console.error('[idbfs] save on sleep failed', err); }
-        location.reload();
+        if (window.cpwebSoftReboot) window.cpwebSoftReboot();
       });
       return;
     }
   } catch (e) { console.error('[idbfs] wake persist failed', e); }
-  location.reload();
+  if (window.cpwebSoftReboot) window.cpwebSoftReboot();
 });
 
-// Tell the page the firmware has painted its first real frame, so it can fade
-// out the "Waking…" splash. Safe to call every frame; the JS side latches once.
+// Tell the page the firmware has painted its first real frame -- the general
+// readiness latch (window.__cpFirstFrame) anything calling into the WASM
+// exports gates on. Fires on cold boot and again after every soft reboot.
 EM_JS(void, cpweb_signal_first_frame, (), {
   if (window.cpwebFirstFrame) window.cpwebFirstFrame();
 });
@@ -67,8 +67,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void cp_sd_fonts_changed() {
 }
 
 // Flush a frame the render task finished, and announce the very first one so
-// the page can drop its "Waking..." splash. Every path that presents goes
-// through here, including the ones that skip firmware work this frame.
+// the page can start trusting the WASM exports (window.__cpFirstFrame). Every
+// path that presents goes through here, including the ones that skip firmware
+// work this frame.
 static void present_and_signal() {
   static bool firstFrameSignaled = false;
   if (display.presentIfNeeded() && !firstFrameSignaled) {
@@ -86,10 +87,19 @@ static void main_tick() {
 
   if (gpio.isWebSleepActive()) {
     // Deep sleep: the firmware loop() is parked (see HalGPIO::startDeepSleep).
-    // Keep the sleep screen on-canvas and wait for the power button; on wake,
-    // persist state and reload (= chip reset -> boot screen -> resume).
+    // Keep the sleep screen on-canvas and wait for the power button. Every
+    // other target treats a power-button wake as a fresh boot, not a resume
+    // in place (see startDeepSleep() in patches/simulator-web.patch); getting
+    // that here without a visible browser reload means stopping this instance
+    // for good right now and handing off to the page, which reboots the WASM
+    // module in place against the same canvas -- see cpweb_persist_and_reboot
+    // and cpwebSoftReboot (switcher.html). The canvas keeps showing this
+    // frame (the sleep screen) until the fresh instance's first frame paints
+    // over it.
     if (gpio.pollWebSleepWake()) {
-      cpweb_persist_and_reload();
+      emscripten_cancel_main_loop();
+      SDL_Quit();
+      cpweb_persist_and_reboot();
       return;
     }
     present_and_signal();
@@ -112,8 +122,7 @@ static void main_tick() {
   gpio.beginFrame();
   loop();
   // The render task set pendingPresent from its worker; flush to the canvas here
-  // on the main thread, where SDL/WebGL is valid. On the first frame we actually
-  // present, drop the "Waking…" splash the page shows across a sleep/wake reload.
+  // on the main thread, where SDL/WebGL is valid.
   present_and_signal();
 }
 

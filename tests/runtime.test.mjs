@@ -5,17 +5,13 @@ import vm from 'node:vm';
 import { FramebufferReader } from '../runtime/framebuffer.js';
 import { createFilesystemLoader } from '../runtime/filesystem.js';
 
-test('wake splash timeout never announces a firmware frame', () => {
+test('cpwebFirstFrame is the only thing that announces a firmware frame', () => {
   const html = readFileSync(new URL('../switcher.html', import.meta.url), 'utf8');
-  const bridge = html.slice(html.indexOf('    // --- Wake bridge'), html.indexOf('    // Integer-scale'));
-  const window = {}, timers = [];
-  vm.runInNewContext(bridge, {
-    window,
-    document: { getElementById: () => ({ classList: { add() {}, remove() {} } }) },
-    sessionStorage: { getItem: () => '1', removeItem() {} },
-    setTimeout: (fn, delay) => timers.push({ fn, delay }),
-  });
-  timers.find(timer => timer.delay === 15000).fn();
+  const marker = '    // Called from the WASM runtime';
+  const bridge = html.slice(html.indexOf(marker), html.indexOf('    // Integer-scale'));
+  assert.ok(bridge.includes('window.cpwebFirstFrame'), 'readiness latch moved or was renamed');
+  const window = {};
+  vm.runInNewContext(bridge, { window });
   assert.equal(window.__cpFirstFrame, undefined);
   window.cpwebFirstFrame();
   assert.equal(window.__cpFirstFrame, true);
