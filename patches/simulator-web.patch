@@ -209,10 +209,10 @@ index d7d3ba1..9683073 100644
    bool shouldQuit() const;
  
 diff --git a/src/HalFrontlight.cpp b/src/HalFrontlight.cpp
-index 4943dd7..1fbbee9 100644
+index 4943dd7..74583a9 100644
 --- a/src/HalFrontlight.cpp
 +++ b/src/HalFrontlight.cpp
-@@ -46,3 +46,16 @@ uint8_t HalFrontlight::brightness() const { return lastBrightness; }
+@@ -46,3 +46,22 @@ uint8_t HalFrontlight::brightness() const { return lastBrightness; }
  uint8_t HalFrontlight::warmth() const { return lastWarmth; }
  
  bool HalFrontlight::isOn() const { return lit; }
@@ -227,6 +227,12 @@ index 4943dd7..1fbbee9 100644
 +EMSCRIPTEN_KEEPALIVE int cp_frontlight_on() { return Frontlight.isOn() ? 1 : 0; }
 +EMSCRIPTEN_KEEPALIVE int cp_frontlight_brightness() { return Frontlight.brightness(); }
 +EMSCRIPTEN_KEEPALIVE int cp_frontlight_warmth() { return Frontlight.warmth(); }
++// Runtime-only, called once by web_main.cpp the instant simulated deep sleep
++// begins -- real hardware cuts the frontlight's power immediately, but
++// nothing else here does, since main_tick() just stops driving loop() rather
++// than tearing anything down. Never touches SETTINGS/frontlightOn, so the
++// preference Frontlight.begin() restores from on the next boot is untouched.
++EMSCRIPTEN_KEEPALIVE void cp_frontlight_set_on(int on) { Frontlight.setOn(on != 0); }
 +}
 +#endif
 diff --git a/src/HalGPIO.cpp b/src/HalGPIO.cpp

@@ -28,6 +28,11 @@ extern void setup();
 extern void loop();
 extern HalDisplay display;  // defined in firmware main.cpp
 
+// Defined per variant (patches/simulator-web.patch's HalFrontlight.cpp hunk;
+// shims/crossink/frontlight_exports.cpp) against whichever Frontlight
+// singleton that firmware actually drives.
+extern "C" void cp_frontlight_set_on(int on);
+
 // Persist the firmware's runtime state tree (/fs_/.crosspoint, mounted as IDBFS
 // by the page loader) to IndexedDB, then hand off to the page to reboot the
 // WASM instance in place -- see cpwebSoftReboot in switcher.html. The fresh
@@ -87,15 +92,26 @@ static void main_tick() {
 
   if (gpio.isWebSleepActive()) {
     // Deep sleep: the firmware loop() is parked (see HalGPIO::startDeepSleep).
-    // Keep the sleep screen on-canvas and wait for the power button. Every
-    // other target treats a power-button wake as a fresh boot, not a resume
-    // in place (see startDeepSleep() in patches/simulator-web.patch); getting
-    // that here without a visible browser reload means stopping this instance
-    // for good right now and handing off to the page, which reboots the WASM
-    // module in place against the same canvas -- see cpweb_persist_and_reboot
-    // and cpwebSoftReboot (switcher.html). The canvas keeps showing this
-    // frame (the sleep screen) until the fresh instance's first frame paints
-    // over it.
+    // Keep the sleep screen on-canvas and wait for the power button. Nothing
+    // about entering sleep here actually cuts power the way real hardware
+    // would, so without this the frontlight -- and therefore the 3D view's
+    // panel glow -- would stay exactly as it was, live, over a screen that's
+    // supposed to be asleep. Turn it off once, right on the transition; the
+    // fresh boot's own Frontlight.begin() restores it from the (untouched)
+    // persisted setting if "Restore Light on Wake" applies.
+    static bool wasAsleep = false;
+    if (!wasAsleep) {
+      wasAsleep = true;
+      cp_frontlight_set_on(0);
+    }
+    // Every other target treats a power-button wake as a fresh boot, not a
+    // resume in place (see startDeepSleep() in patches/simulator-web.patch);
+    // getting that here without a visible browser reload means stopping this
+    // instance for good right now and handing off to the page, which reboots
+    // the WASM module in place against the same canvas -- see
+    // cpweb_persist_and_reboot and cpwebSoftReboot (switcher.html). The
+    // canvas keeps showing this frame (the sleep screen, now unlit) until the
+    // fresh instance's first frame paints over it.
     if (gpio.pollWebSleepWake()) {
       emscripten_cancel_main_loop();
       SDL_Quit();

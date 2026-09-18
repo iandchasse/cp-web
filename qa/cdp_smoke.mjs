@@ -192,6 +192,13 @@ try {
     await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
     await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
     await sleep(500);
+    // Nothing about simulated sleep cuts power the way real hardware would,
+    // so the firmware has to say so itself (cp_frontlight_set_on(0), called
+    // once on the sleep transition in web_main.cpp) or the panel stays lit
+    // over a screen that's supposed to be asleep.
+    assert.equal(await js('Module._cp_frontlight_on()'), 0, 'frontlight must go dark on sleep, not just after wake');
+    await until(() => js('window.__dev3d.screen.material.emissiveIntensity === 0'),
+                'panel goes dark on sleep', 10000);
     await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'p', code: 'KeyP', windowsVirtualKeyCode: 80 });
     await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'p', code: 'KeyP', windowsVirtualKeyCode: 80 });
     // A real navigation would drop every JS global, including this one.
@@ -201,12 +208,13 @@ try {
     assert.equal(await js('window.__dev3d ? window.__dev3d.uuid : null'), dev3dBefore,
       'the 3D scene must survive a wake untouched');
     assert.equal(await js('typeof Module._cp_frontlight_on'), 'function', 'frontlight exports missing after wake');
-    // Not asserting a specific value: the light was just turned on above, and
-    // the fresh boot legitimately restores that from persisted state, same as
-    // a real wake. A thrown/rejected call here (an unresolved import symbol,
-    // an abort) would fail this await; getting a real 0/1 back is what
-    // proves the export is alive, not a stub.
-    assert.ok([0, 1].includes(await js('Module._cp_frontlight_on()')), 'frontlight export did not return a real state');
+    // "Restore Light on Wake" (CrossPointSettings::frontlightRestoreOnWake)
+    // defaults on, and nothing here touched it -- the persisted frontlightOn
+    // this build's own e2e check set (still true) means the fresh boot's
+    // Frontlight.begin() should turn the light back on, same as real wake.
+    assert.equal(await js('Module._cp_frontlight_on()'), 1, 'frontlight did not restore on wake');
+    await until(() => js('window.__dev3d.screen.material.emissiveIntensity > 0'),
+                'panel lit again after wake', 10000);
     console.log(`${model}: sleep/wake rebooted the WASM instance without touching the page`);
 
     // Drive a real physical-button press through the capture listeners.

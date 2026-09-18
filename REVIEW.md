@@ -242,6 +242,21 @@ building before any of the wiring was written.
   fragile: "the frontlight quick panel opens on a top-edge swipe" is only true
   from Home, and *which* screen a woken instance resumes into depends on
   exactly where sleep caught it, not on how many `Escape` presses came before.
+- **Sleep didn't turn the frontlight off.** `firmware/src/main.cpp`'s own
+  comment says it plainly — "a normal wake starts with the light off unless
+  Restore Light on Wake is enabled" (`CrossPointSettings::
+  frontlightRestoreOnWake`, on by default) — real hardware cuts frontlight
+  power the instant deep sleep begins, then `Frontlight.begin()` decides
+  whether to turn it back on at the *next* boot. Simulated sleep never cut
+  anything (nothing is torn down until wake reboots the instance — that's the
+  point of the sleep/wake work above), so the 3D panel kept glowing over a
+  screen that was supposed to be dark. New per-variant export
+  `cp_frontlight_set_on(int)` (same pattern as the other `cp_frontlight_*`
+  calls — `patches/simulator-web.patch` for CrossPoint,
+  `shims/crossink/frontlight_exports.cpp` for CrossInk), called once by
+  `web_main.cpp` on the sleep transition. Runtime-only: it never touches
+  `SETTINGS`, so `Frontlight.begin()`'s own restore-on-wake logic still reads
+  the real, untouched preference on the next boot.
 
 ## Validation
 

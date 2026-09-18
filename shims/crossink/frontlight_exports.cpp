@@ -17,4 +17,10 @@ EMSCRIPTEN_KEEPALIVE int cp_frontlight_present() { return Frontlight.present() ?
 EMSCRIPTEN_KEEPALIVE int cp_frontlight_on() { return Frontlight.isOn() ? 1 : 0; }
 EMSCRIPTEN_KEEPALIVE int cp_frontlight_brightness() { return Frontlight.brightness(); }
 EMSCRIPTEN_KEEPALIVE int cp_frontlight_warmth() { return Frontlight.warmth(); }
+// Runtime-only, called once by web_main.cpp the instant simulated deep sleep
+// begins -- real hardware cuts the frontlight's power immediately, but
+// nothing else here does, since main_tick() just stops driving loop() rather
+// than tearing anything down. Never touches SETTINGS/frontlightOn, so the
+// preference Frontlight.begin() restores from on the next boot is untouched.
+EMSCRIPTEN_KEEPALIVE void cp_frontlight_set_on(int on) { Frontlight.setOn(on != 0); }
 }
