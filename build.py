@@ -127,9 +127,10 @@ def firmware_version(variant):
     except OSError:
         pass
     key = variant.upper() + "_FIRMWARE_REF="
-    for line in open(os.path.join(ROOT, "pins.env"), encoding="utf-8"):
-        if line.startswith(key):
-            return line.split("=", 1)[1].strip()[:8] + "-web"
+    with open(os.path.join(ROOT, "pins.env"), encoding="utf-8") as f:
+        for line in f:
+            if line.startswith(key):
+                return line.split("=", 1)[1].strip()[:8] + "-web"
     return "unknown-web"
 
 

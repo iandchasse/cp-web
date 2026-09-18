@@ -128,14 +128,23 @@ class BuildTests(unittest.TestCase):
         # CrossInk's firmware drives the inline HalFrontlight in its own
         # include/CrossInkHalFrontlight.h, not the simulator's. Exporting from
         # the simulator read a light nobody switched on.
+        #
+        # Checked against excluded() with a synthetic path, not against
+        # collect_sources() walking the real simulator checkout: CI runs this
+        # suite before the "Clone firmware and simulator" step, so
+        # simulator/src/ does not exist yet at test time and collect_sources()
+        # would find nothing there regardless of what excluded() says.
         build.use_variant('crossink')
-        sources = [build.norm(s) for s in build.collect_sources()]
-        self.assertFalse(any(s.endswith('/simulator-crossink/src/halfrontlight.cpp') for s in sources),
+        self.assertTrue(build.excluded(os.path.join(build.SIM, 'src', 'HalFrontlight.cpp')),
                          "the simulator's HalFrontlight must not be compiled for CrossInk")
+        # shims/ is part of this repo, not an external checkout, so it is
+        # always present -- safe to check via collect_sources() directly.
+        sources = [build.norm(s) for s in build.collect_sources()]
         self.assertTrue(any(s.endswith('/shims/crossink/frontlight_exports.cpp') for s in sources))
         build.use_variant('crosspoint')
+        self.assertFalse(build.excluded(os.path.join(build.SIM, 'src', 'HalFrontlight.cpp')),
+                          "CrossPoint must still compile the simulator's own HalFrontlight")
         sources = [build.norm(s) for s in build.collect_sources()]
-        self.assertTrue(any(s.endswith('/simulator/src/halfrontlight.cpp') for s in sources))
         self.assertFalse(any('/shims/crossink/' in s for s in sources))
         build.use_variant(build.ENABLED_VARIANTS[0])
 
